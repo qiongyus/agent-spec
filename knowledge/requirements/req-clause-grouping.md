@@ -132,6 +132,8 @@ Scenario: 分组不影响门禁
 
 ## Source Trace
 
+- proposal: LEP-006 (knowledge/proposals/2026-09-26-clause-grouping.md)
+- decision: ADR-005（判定规则、`Rule:` 例外、单级标签、无分组输出逐字节不变，2026-09-26）
 - 实测证据: amberlog@2026-09-26 `knowledge/requirements/req-amb-err-envelope-requirement.md`（26 条 / 11 场景）加 `###` 后条款数 26 → 28、新增 2 Info + 2 Warning
 - 先例: `extract_requirements` 已把 `<!--` 注释行排除在条款之外；`scenario_attributions` 已对 `#` 前缀容错
 - 写法动机: 用例规格的「主流程 → 各步分支、先正常后异常」排序需要块内层次

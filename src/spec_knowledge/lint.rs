@@ -619,6 +619,29 @@ mod tests {
     }
 
     #[test]
+    fn test_group_headings_produce_no_clause_diagnostics() {
+        let doc = parse_req(
+            "---\nkind: requirement\nid: REQ-011\n---\n## Problem\np\n## Requirements\n### Envelope\n[REQ-011] The API MUST return JSON.\n## Scenarios\n### Envelope\nScenario: JSON body\n  Given a running service\n  When the client requests an unknown route\n  Then the response body is a JSON object\n",
+        );
+        let rules: Vec<_> = lint_requirement(&doc)
+            .iter()
+            .map(|d| d.rule.clone())
+            .collect();
+        assert!(
+            !rules.contains(&"requirement-bcp14-keyword".to_string()),
+            "{rules:?}"
+        );
+        assert!(
+            !rules.contains(&"requirement-needs-id".to_string()),
+            "{rules:?}"
+        );
+        assert!(
+            !rules.contains(&"requirement-empty".to_string()),
+            "{rules:?}"
+        );
+    }
+
+    #[test]
     fn test_requirement_compound_and_no_keyword_warn() {
         let doc = parse_req(
             "---\nkind: requirement\nid: REQ-003\n---\n## Problem\np\n## Requirements\n[REQ-003] The API MUST log and the client MUST retry.\nthe cache is warmed at boot.\n",

@@ -81,6 +81,19 @@ pub struct RequirementClause {
     pub keyword: Option<NormativeKeyword>,
     /// The full clause text (without the leading `[id]` marker).
     pub text: String,
+    /// Title of the nearest preceding `### Group` heading inside
+    /// `## Requirements`, if any. Grouping is presentational: it never changes
+    /// a clause's id, keyword, or numbering.
+    pub group: Option<String>,
+}
+
+/// Recognize a `###`-style grouping heading inside a `## Requirements` or
+/// `## Scenarios` section. Level-2 headings never reach here (they split
+/// sections), so any line opening with `#` is a group label. Returns the
+/// heading title (possibly empty, which clears the current group).
+pub(crate) fn group_heading(line: &str) -> Option<&str> {
+    line.strip_prefix('#')
+        .map(|rest| rest.trim_start_matches('#').trim())
 }
 
 /// Explicit coverage of identifiable MUST/MUST NOT clauses by requirement
@@ -95,14 +108,22 @@ pub struct ClauseCoverage {
 
 /// Extract normative clauses from a requirement doc's `## Requirements` section.
 /// One clause per non-empty, non-bullet-only line. Lines may start with a `-`
-/// bullet which is stripped.
+/// bullet which is stripped. `### Group` headings are grouping labels, never
+/// clauses: they scope the clauses that follow them (see
+/// [`RequirementClause::group`]).
 pub fn extract_requirements(doc: &KnowledgeDoc) -> Vec<RequirementClause> {
     let Some(section) = doc.section("Requirements") else {
         return Vec::new();
     };
     let mut clauses = Vec::new();
+    let mut group: Option<String> = None;
     for raw in section.body.lines() {
-        let line = raw.trim().trim_start_matches('-').trim();
+        let trimmed = raw.trim();
+        if let Some(title) = group_heading(trimmed) {
+            group = (!title.is_empty()).then(|| title.to_string());
+            continue;
+        }
+        let line = trimmed.trim_start_matches('-').trim();
         if line.is_empty() {
             continue;
         }
@@ -113,7 +134,12 @@ pub fn extract_requirements(doc: &KnowledgeDoc) -> Vec<RequirementClause> {
         }
         let (id, text) = split_id_prefix(line);
         let keyword = NormativeKeyword::detect(&text);
-        clauses.push(RequirementClause { id, keyword, text });
+        clauses.push(RequirementClause {
+            id,
+            keyword,
+            text,
+            group: group.clone(),
+        });
     }
     clauses
 }
@@ -287,6 +313,19 @@ mod tests {
         assert_eq!(clauses[1].keyword, Some(NormativeKeyword::Should));
         assert_eq!(clauses[2].id, None);
         assert_eq!(clauses[2].keyword, Some(NormativeKeyword::May));
+    }
+
+    #[test]
+    fn test_group_heading_is_not_a_clause_and_scopes_following_clauses() {
+        let doc = parse(
+            "---\nkind: requirement\nid: REQ-010\n---\n## Problem\np\n## Requirements\n### Envelope\n[REQ-010-A] The API MUST return JSON.\n#### Fields\n[REQ-010-B] The body MUST carry `code`.\n###\n[REQ-010-C] The cache MAY be warmed.\n",
+        );
+        let clauses = extract_requirements(&doc);
+        assert_eq!(clauses.len(), 3, "headings must not count as clauses");
+        assert_eq!(clauses[0].id.as_deref(), Some("REQ-010-A"));
+        assert_eq!(clauses[0].group.as_deref(), Some("Envelope"));
+        assert_eq!(clauses[1].group.as_deref(), Some("Fields"));
+        assert_eq!(clauses[2].group, None, "an empty heading clears the group");
     }
 
     #[test]

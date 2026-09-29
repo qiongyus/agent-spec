@@ -13,7 +13,8 @@ tags: [knowledge, verify, guard, requirements]
 
 A downstream workspace (amberlog, 2026-09-28) accepted 17 requirement blocks in
 one governance step and then drafted one task contract per block — 313
-scenarios in total. Wiring those contracts into CI surfaced four gaps. Each was
+scenarios in total. Wiring those contracts into CI surfaced four gaps, and
+ordering the first round's work from `requirements plan` surfaced a fifth. Each was
 reproduced against agent-spec 1.4.0 (`main` at `2483398`; the
 `feat/clause-grouping` fork at `5ae1dc1` behaves identically in every code path
 cited below).
@@ -82,6 +83,22 @@ and `Review: human` do not help: both still require the test to run under
 guard, and `Review: human` yields `pending_review`, which guard's default
 `auto` review mode counts as a pass.
 
+**Gap 5 — dependencies on a superseded block are silently dropped.**
+`build_requirement_graph` does not carry `supersedes:` into `RequirementNode`,
+and `build_batches` (`src/spec_knowledge/requirement_plan.rs`) keeps a
+`Dependency` edge only when both ends are `Ready`. A superseded block is never
+`Ready`, so an edge from `## Dependencies: REQ-X` to a dependent block vanishes
+as soon as `REQ-X` is replaced by `REQ-X-V2` — the dependent floats up to the
+first batch. amberlog (2026-09-29) has 45 such edges: 9 blocks were
+superseded, and most dependents still name the original id. `requirements plan`
+reported 5 batches with `REQ-AMB-STO-MANIFEST-COMMIT` in batch 1; resolving
+each dependency through the `supersedes:` chain gives the 9 layers the
+downstream plan derived by hand (`amberlog-spec`
+`campaigns/first-release/increments-plan.md` §5), with that block in layer 4.
+The governance lint already warns `references-superseded` for such ids, but a
+warning does not repair the ordering, and a batch list that is wrong without
+any error is worse than one that fails.
+
 ## Motivation
 
 agent-spec's value is that a green gate means "the contract holds". Gap 2 and
@@ -99,6 +116,8 @@ text format and must be re-derived by every adopter.
 - A scenario can name the cargo features its test needs.
 - A scenario can declare itself long-running so that per-commit gates defer it
   while an explicit verification run still executes and records it.
+- A dependency on a superseded requirement orders work after its current
+  replacement, never after nothing.
 
 ## Non-Goals
 
@@ -150,6 +169,34 @@ with `--review-mode strict`) treat a deferred soak scenario as non-passing
 unless it has a recorded result, so a release gate cannot close on an unrun
 soak test.
 
+**D5. Dependencies resolve through supersession.** `RequirementNode` carries
+`supersedes`. `RequirementGraph::current_dependencies` resolves each
+`## Dependencies` id: while the named block is `status: superseded`, follow the
+unique block whose `supersedes:` names it; stop at the first block that is not
+itself superseded. So `REQ-X` (superseded) → `REQ-X-V2` (accepted) →
+`REQ-X-V3` (proposed) resolves to `REQ-X-V2`: a proposed successor never
+replaces an accepted block. The declared ids stay as written in the graph
+(`requirements export` round-trips them unchanged); resolution is a view used
+by:
+
+- `requirements plan`: `Dependency` edges start at the resolved block, and
+  carry `declared_as: <superseded id>` when resolution rewrote them; batches
+  are computed from those edges.
+- `requirements work-units`: `depends_on` lists the resolved ids (and
+  `draft-specs` inherits them).
+- `requirements graph` cycle detection, so a cycle that only closes through a
+  replacement is reported as `dependency-cycle` instead of silently removing
+  its blocks from every batch.
+
+A dependency that resolves to the depending block itself (it named its own
+predecessor) is dropped. A superseded block with no successor, with more than
+one successor, or on a looping `supersedes:` chain stays unresolved: the edge
+keeps its declared id (and, as today, drops out of batching), and the graph
+reports the new Warning `dependency-supersession-unresolved` on each
+non-superseded dependent. `references-superseded` is unchanged: resolution
+keeps the plan correct, and the lint still asks authors to update the
+declaration.
+
 ## Compatibility
 
 - CLI and public API: D1 adds three diagnostic codes and relaxes one outcome
@@ -157,6 +204,13 @@ soak test.
   (ignored → `pass` becomes `skip`); specs that were green only because of
   ignored tests will turn red under guard — intended, and called out in the
   release notes. D3 and D4 are additive.
+- D5 changes `requirements plan` batches, `work-units` `depends_on` and
+  `requirements graph` cycle diagnostics for any workspace whose
+  `## Dependencies` name superseded blocks — intended, since the previous
+  output was wrong. Plan JSON edges gain an optional `declared_as` field;
+  graph JSON nodes gain an optional `supersedes` field. Workspaces without
+  superseded dependencies see identical output (agent-spec's own
+  `requirements plan` output is byte-identical).
 - File formats: the selector gains one optional field; scenarios gain one
   `Mode` value. Older agent-spec versions do not reject it: the parser maps any
   mode other than `optimize` to `Standard` (`src/spec_parser/parser.rs`), so an
@@ -177,6 +231,9 @@ soak test.
 - D3: downstream self dev-dependency workarounds may be removed after adding
   `Features:` to the affected selectors; keeping them is harmless.
 - D4: none.
+- D5: none required. Updating `## Dependencies` to the current ids remains
+  good hygiene (and clears `references-superseded`), but the plan no longer
+  depends on it.
 
 ## Security Considerations
 
@@ -249,6 +306,13 @@ count, and D2 is a behavior change on upgrade.
 - D4: older versions silently treat `Mode: soak` as `Standard` (see
   Compatibility). Is a warning for unknown mode values worth adding in the same
   change, so the next such extension is not silent?
+- D5: should an unresolved superseded dependency be an Error instead of a
+  Warning? It degrades to today's behavior (the edge drops out of batching), so
+  the batch list can still be wrong.
+- D5: when the current replacement is not `Ready` (for example it is blocked
+  on open questions), the edge still drops out of batching, as any dependency
+  on a non-ready block does today. Should that pre-existing rule change too, or
+  stay out of this proposal?
 
 ## Produces
 

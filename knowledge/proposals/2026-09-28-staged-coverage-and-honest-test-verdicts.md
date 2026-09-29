@@ -14,7 +14,8 @@ tags: [knowledge, verify, guard, requirements]
 A downstream workspace (amberlog, 2026-09-28) accepted 17 requirement blocks in
 one governance step and then drafted one task contract per block — 313
 scenarios in total. Wiring those contracts into CI surfaced four gaps, and
-ordering the first round's work from `requirements plan` surfaced a fifth. Each was
+ordering the first round's work from `requirements plan` surfaced a fifth. Moving the first fully green contract into `specs/`
+(2026-09-29) surfaced a sixth. Each was
 reproduced against agent-spec 1.4.0 (`main` at `2483398`; the
 `feat/clause-grouping` fork at `5ae1dc1` behaves identically in every code path
 cited below).
@@ -99,6 +100,25 @@ The governance lint already warns `references-superseded` for such ids, but a
 warning does not repair the ordering, and a batch list that is wrong without
 any error is worse than one that fails.
 
+**Gap 6 — `guard` checks every contract's boundaries against every change.**
+`cmd_guard` (`src/main.rs`) resolves one change set for the whole commit and
+then calls `verify_with_changes(code, &effective_changes)` for *each* spec in
+`--spec-dir`; the boundaries verifier checks every changed path against that
+spec's `Allowed changes` / `Forbidden` lists. A change that belongs to a
+different contract, or to no contract at all, is therefore reported as out of
+bounds by every contract that does not happen to allow it. In amberlog, with a
+single contract (`REQ-AMB-ING-ACK-RESPONSE`, scoped to the ingest and server
+crates) moved into `specs/`, a staged edit to `crates/query/src/lib.rs`,
+`docs/…`, `tools/…` or `.gitlab-ci.yml` failed guard as "not covered by any
+allowed boundary"; so did the commit that moved the contract itself (neither
+`specs/task-amb-ing-ack-response.spec.md` nor its `specs/roadmap/` source path
+is in its allow-list). All 17 contracts forbid `knowledge/**`, so once any of
+them is active, every `requirements supersede` commit is blocked too. Narrowing
+`Allowed changes` — which is what the contract author is told to do — makes the
+failure more frequent, not less. The downstream workaround is
+`agent-spec guard --change-scope none` in both pre-commit and CI, which keeps
+lint and test verification but drops boundary enforcement entirely.
+
 ## Motivation
 
 agent-spec's value is that a green gate means "the contract holds". Gap 2 and
@@ -118,6 +138,8 @@ text format and must be re-derived by every adopter.
   while an explicit verification run still executes and records it.
 - A dependency on a superseded requirement orders work after its current
   replacement, never after nothing.
+- `guard` holds each contract to its own boundaries without failing commits
+  that only touch other contracts' territory.
 
 ## Non-Goals
 
@@ -196,6 +218,20 @@ reports the new Warning `dependency-supersession-unresolved` on each
 non-superseded dependent. `references-superseded` is unchanged: resolution
 keeps the plan correct, and the lint still asks authors to update the
 declaration.
+
+**D6. Guard checks boundaries per contract, against the changes that concern it.**
+`cmd_guard` stops applying every contract's boundaries to the whole change set.
+A changed path is checked against a contract's `Forbidden` list always (a
+forbidden path stays forbidden no matter which work touched it), but against
+its `Allowed changes` list only when the path is *attributed* to that contract.
+A path is attributed to a contract when it matches that contract's allow-list,
+when it is the contract file itself (or its move source, for a rename out of
+`specs/roadmap/`), or when the commit changes no other active contract and the
+path matches no contract's allow-list. A path matched by no active contract's
+allow-list and not attributable is reported once, as the Warning
+`change-unowned`, instead of once per contract as an Error.
+`guard --strict-boundaries` keeps today's behavior for workspaces that want
+every commit to stay inside every contract.
 
 ## Compatibility
 
@@ -313,6 +349,14 @@ count, and D2 is a behavior change on upgrade.
   on open questions), the edge still drops out of batching, as any dependency
   on a non-ready block does today. Should that pre-existing rule change too, or
   stay out of this proposal?
+- D6: should a path matched by no contract's allow-list be an Error only
+  when the commit also touches some contract's territory (mixed commit), and
+  pass silently otherwise? The proposal reports it as a Warning in all cases.
+- D6: should a contract's `Forbidden` list apply to commits that do not touch
+  its territory at all? amberlog's `Forbidden: knowledge/**` means "an
+  implementation session must not edit the truth layer", which is a property
+  of who commits, not of the path; keeping `Forbidden` global still blocks
+  governance commits (supersede) in the product repo.
 
 ## Produces
 

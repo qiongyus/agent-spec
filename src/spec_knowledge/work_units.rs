@@ -52,7 +52,11 @@ impl WorkUnitSet {
 }
 
 pub fn build_work_units(graph: &RequirementGraph) -> WorkUnitSet {
-    let mut units = graph.nodes.iter().map(unit_from_node).collect::<Vec<_>>();
+    let mut units = graph
+        .nodes
+        .iter()
+        .map(|node| unit_from_node(graph, node))
+        .collect::<Vec<_>>();
     units.sort_by(|a, b| a.requirement_id.cmp(&b.requirement_id));
     WorkUnitSet {
         version: 1,
@@ -61,7 +65,7 @@ pub fn build_work_units(graph: &RequirementGraph) -> WorkUnitSet {
     }
 }
 
-fn unit_from_node(node: &RequirementNode) -> WorkUnit {
+fn unit_from_node(graph: &RequirementGraph, node: &RequirementNode) -> WorkUnit {
     let has_questions = !node.open_questions.is_empty();
     let has_scenarios = !node.scenarios.is_empty();
     let has_children = !node.children.is_empty();
@@ -96,7 +100,11 @@ fn unit_from_node(node: &RequirementNode) -> WorkUnit {
         source_path: node.source_path.clone(),
         mode,
         status,
-        depends_on: node.dependencies.clone(),
+        depends_on: graph
+            .current_dependencies(node)
+            .into_iter()
+            .map(|dep| dep.id)
+            .collect(),
         satisfies: vec![node.id.clone()],
         scenario_count: node.scenarios.len(),
         blocked_by: node.open_questions.clone(),
@@ -123,6 +131,7 @@ mod tests {
             id: id.to_string(),
             title: format!("{id} title"),
             status: Some(crate::spec_knowledge::DecisionStatus::Accepted),
+            supersedes: None,
             source_path: PathBuf::from(format!(
                 "knowledge/requirements/{}.md",
                 id.to_ascii_lowercase()

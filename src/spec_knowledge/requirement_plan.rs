@@ -55,6 +55,10 @@ pub struct RequirementPlanEdge {
     pub from: String,
     pub to: String,
     pub kind: RequirementPlanEdgeKind,
+    /// For a dependency edge resolved through supersession: the superseded
+    /// id as written in `## Dependencies`; `from` is its current replacement.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declared_as: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -121,11 +125,12 @@ pub fn build_requirement_plan(knowledge_dir: &Path, specs_dir: &Path) -> Require
 
     let mut edges = Vec::new();
     for node in &graph.nodes {
-        for dep in &node.dependencies {
+        for dep in graph.current_dependencies(node) {
             edges.push(RequirementPlanEdge {
-                from: dep.clone(),
+                from: dep.id,
                 to: node.id.clone(),
                 kind: RequirementPlanEdgeKind::Dependency,
+                declared_as: dep.declared_as,
             });
         }
         for child in &node.children {
@@ -133,6 +138,7 @@ pub fn build_requirement_plan(knowledge_dir: &Path, specs_dir: &Path) -> Require
                 from: node.id.clone(),
                 to: child.clone(),
                 kind: RequirementPlanEdgeKind::Child,
+                declared_as: None,
             });
         }
     }
@@ -141,6 +147,7 @@ pub fn build_requirement_plan(knowledge_dir: &Path, specs_dir: &Path) -> Require
             from: unit.requirement_id.clone(),
             to: unit.id.clone(),
             kind: RequirementPlanEdgeKind::WorkUnit,
+            declared_as: None,
         });
     }
     let known_requirements = requirements
@@ -158,6 +165,7 @@ pub fn build_requirement_plan(knowledge_dir: &Path, specs_dir: &Path) -> Require
                     from: format!("WU-{requirement_id}"),
                     to: spec.id.clone(),
                     kind: RequirementPlanEdgeKind::Satisfies,
+                    declared_as: None,
                 });
             } else {
                 spec_diagnostics.push(RequirementPlanDiagnostic {
@@ -177,6 +185,7 @@ pub fn build_requirement_plan(knowledge_dir: &Path, specs_dir: &Path) -> Require
                     from: dependency.clone(),
                     to: spec.id.clone(),
                     kind: RequirementPlanEdgeKind::SpecDepends,
+                    declared_as: None,
                 });
             } else {
                 spec_diagnostics.push(RequirementPlanDiagnostic {
@@ -690,6 +699,99 @@ mod tests {
                 .iter()
                 .any(|diag| { diag.code == "dangling-spec-coverage" && diag.severity == "error" })
         );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    fn write_requirement(
+        knowledge: &Path,
+        id: &str,
+        status: &str,
+        supersedes: Option<&str>,
+        dependencies: &[&str],
+    ) {
+        let supersedes = supersedes
+            .map(|target| format!("supersedes: {target}\n"))
+            .unwrap_or_default();
+        let dependencies = if dependencies.is_empty() {
+            "None.\n".to_string()
+        } else {
+            dependencies
+                .iter()
+                .map(|dep| format!("- {dep}\n"))
+                .collect::<String>()
+        };
+        fs::write(
+            knowledge.join(format!("requirements/{}.md", id.to_ascii_lowercase())),
+            format!(
+                "---\nkind: requirement\nid: {id}\ntitle: \"{id}\"\nstatus: {status}\n{supersedes}liveness: auto\n---\n## Problem\n{id}.\n## Requirements\n[{id}] The service MUST satisfy {id}.\n## Dependencies\n{dependencies}## Scenarios\nScenario: {id}\n  Given a precondition\n  When {id} runs\n  Then the {id} outcome is visible\n## Source Trace\n- test\n## Open Questions\nNone.\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_requirement_plan_resolves_dependencies_on_superseded_requirements() {
+        let dir = make_temp_dir("requirement-plan-supersession");
+        let knowledge = dir.join("knowledge");
+        let specs = dir.join("specs");
+        fs::create_dir_all(knowledge.join("requirements")).unwrap();
+        fs::create_dir_all(&specs).unwrap();
+        // REQ-BASE was replaced twice; V3 is current, V4 is only proposed.
+        write_requirement(&knowledge, "REQ-BASE", "superseded", None, &[]);
+        write_requirement(
+            &knowledge,
+            "REQ-BASE-V2",
+            "superseded",
+            Some("REQ-BASE"),
+            &[],
+        );
+        write_requirement(
+            &knowledge,
+            "REQ-BASE-V3",
+            "accepted",
+            Some("REQ-BASE-V2"),
+            &[],
+        );
+        write_requirement(
+            &knowledge,
+            "REQ-BASE-V4",
+            "proposed",
+            Some("REQ-BASE-V3"),
+            &[],
+        );
+        write_requirement(&knowledge, "REQ-MID", "accepted", None, &["REQ-BASE"]);
+        write_requirement(&knowledge, "REQ-TOP", "accepted", None, &["REQ-MID"]);
+
+        let plan = build_requirement_plan(&knowledge, &specs);
+
+        let batches = plan
+            .batches
+            .iter()
+            .map(|batch| batch.requirement_ids.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            batches,
+            vec![
+                vec!["REQ-BASE-V3".to_string()],
+                vec!["REQ-MID".to_string()],
+                vec!["REQ-TOP".to_string()],
+            ]
+        );
+        assert!(plan.edges.iter().any(|edge| {
+            edge.from == "REQ-BASE-V3"
+                && edge.to == "REQ-MID"
+                && edge.kind == RequirementPlanEdgeKind::Dependency
+                && edge.declared_as.as_deref() == Some("REQ-BASE")
+        }));
+        assert!(!plan.edges.iter().any(|edge| {
+            edge.from == "REQ-BASE" && edge.kind == RequirementPlanEdgeKind::Dependency
+        }));
+        let mid = plan
+            .work_units
+            .iter()
+            .find(|unit| unit.requirement_id == "REQ-MID")
+            .unwrap();
+        assert_eq!(mid.depends_on, vec!["REQ-BASE-V3"]);
         fs::remove_dir_all(dir).ok();
     }
 

@@ -151,6 +151,7 @@ mod tests {
             id: "REQ-101".into(),
             title: "User Login".into(),
             status: None,
+            supersedes: None,
             source_path: PathBuf::from("knowledge/requirements/req-101-user-login.md"),
             problem: "Users need to log in with existing accounts.".into(),
             clauses: vec![RequirementClauseView {
@@ -219,6 +220,7 @@ mod tests {
             id: "../../REQ-ESCAPE".into(),
             title: "Escape".into(),
             status: None,
+            supersedes: None,
             source_path: PathBuf::from("knowledge/requirements/escape.md"),
             problem: "Escape output root.".into(),
             clauses: Vec::new(),

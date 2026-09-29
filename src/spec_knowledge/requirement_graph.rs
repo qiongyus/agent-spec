@@ -1,8 +1,8 @@
 //! Requirement graph extraction from KLL requirement artifacts.
 
 use crate::spec_knowledge::{
-    KnowledgeKind, KnowledgeParseError, NormativeKeyword, collect_knowledge_checked,
-    extract_requirements,
+    DecisionStatus, KnowledgeKind, KnowledgeParseError, NormativeKeyword,
+    collect_knowledge_checked, extract_requirements,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -21,6 +21,105 @@ impl RequirementGraph {
             .iter()
             .find(|node| node.id.eq_ignore_ascii_case(requirement_id))
     }
+
+    /// `node`'s `## Dependencies`, each resolved through `supersedes:` to the
+    /// block that is current today. A dependency on a superseded block is
+    /// followed forward until it reaches a block that is not itself
+    /// superseded (a proposed successor never replaces an accepted one).
+    /// Dependencies that cannot be resolved stay as declared; a dependency
+    /// that resolves to `node` itself (its own predecessor) is dropped.
+    pub fn current_dependencies(&self, node: &RequirementNode) -> Vec<ResolvedDependency> {
+        let successors = self.successors();
+        let mut out: Vec<ResolvedDependency> = Vec::new();
+        for dep in &node.dependencies {
+            let id = match self.follow_supersession(dep, &successors) {
+                Supersession::Current(id) => id,
+                Supersession::Unresolved { .. } => dep.clone(),
+            };
+            if id.eq_ignore_ascii_case(&node.id) {
+                continue;
+            }
+            let declared_as = (!id.eq_ignore_ascii_case(dep)).then(|| dep.clone());
+            match out.iter_mut().find(|existing| existing.id == id) {
+                // Declared both directly and through a predecessor: the
+                // direct declaration wins.
+                Some(existing) if declared_as.is_none() => existing.declared_as = None,
+                Some(_) => {}
+                None => out.push(ResolvedDependency { id, declared_as }),
+            }
+        }
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        out
+    }
+
+    /// Superseded id (uppercase) -> ids of the blocks declaring `supersedes:` it.
+    fn successors(&self) -> BTreeMap<String, Vec<&str>> {
+        let mut successors: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+        for node in &self.nodes {
+            if let Some(target) = &node.supersedes {
+                successors
+                    .entry(target.to_ascii_uppercase())
+                    .or_default()
+                    .push(node.id.as_str());
+            }
+        }
+        successors
+    }
+
+    fn follow_supersession(
+        &self,
+        requirement_id: &str,
+        successors: &BTreeMap<String, Vec<&str>>,
+    ) -> Supersession {
+        let mut current = requirement_id.to_string();
+        let mut seen = BTreeSet::new();
+        loop {
+            // A missing id is `dangling-dependency`, reported separately.
+            let Some(node) = self.node(&current) else {
+                return Supersession::Current(current);
+            };
+            if node.status != Some(DecisionStatus::Superseded) {
+                return Supersession::Current(node.id.clone());
+            }
+            let key = node.id.to_ascii_uppercase();
+            if !seen.insert(key.clone()) {
+                return Supersession::Unresolved {
+                    at: node.id.clone(),
+                    reason: "its `supersedes:` chain loops".to_string(),
+                };
+            }
+            match successors.get(&key).map(Vec::as_slice) {
+                Some([next]) => current = (*next).to_string(),
+                None | Some([]) => {
+                    return Supersession::Unresolved {
+                        at: node.id.clone(),
+                        reason: "no block declares `supersedes:` for it".to_string(),
+                    };
+                }
+                Some(many) => {
+                    return Supersession::Unresolved {
+                        at: node.id.clone(),
+                        reason: format!("it is superseded by several blocks: {}", many.join(", ")),
+                    };
+                }
+            }
+        }
+    }
+}
+
+/// A `## Dependencies` entry after supersession resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedDependency {
+    /// The block the dependency points at today.
+    pub id: String,
+    /// The id as written in `## Dependencies`, when it named a superseded
+    /// block and resolution replaced it.
+    pub declared_as: Option<String>,
+}
+
+enum Supersession {
+    Current(String),
+    Unresolved { at: String, reason: String },
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -29,6 +128,8 @@ pub struct RequirementNode {
     pub title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<crate::spec_knowledge::DecisionStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
     pub source_path: PathBuf,
     pub problem: String,
     pub clauses: Vec<RequirementClauseView>,
@@ -110,6 +211,7 @@ pub fn build_requirement_graph(knowledge_dir: &Path) -> RequirementGraph {
                 id: doc.meta.id.clone(),
                 title,
                 status: doc.meta.status,
+                supersedes: doc.meta.supersedes.clone(),
                 source_path: doc.source_path.clone(),
                 problem: section_body(&doc, "Problem"),
                 clauses: extract_requirements(&doc)
@@ -159,6 +261,7 @@ pub fn validate_requirement_graph(graph: &RequirementGraph) -> Vec<RequirementGr
     }
 
     let known = by_id.keys().copied().collect::<BTreeSet<_>>();
+    let successors = graph.successors();
     for node in &graph.nodes {
         for dep in &node.dependencies {
             if !known.contains(dep.as_str()) {
@@ -167,6 +270,22 @@ pub fn validate_requirement_graph(graph: &RequirementGraph) -> Vec<RequirementGr
                     Some(node.id.clone()),
                     format!("{} depends on missing requirement {dep}", node.id),
                 ));
+            }
+        }
+        if node.status != Some(DecisionStatus::Superseded) {
+            for dep in &node.dependencies {
+                if let Supersession::Unresolved { at, reason } =
+                    graph.follow_supersession(dep, &successors)
+                {
+                    diagnostics.push(diag(
+                        "dependency-supersession-unresolved",
+                        Some(node.id.clone()),
+                        format!(
+                            "{} depends on {dep}, which is superseded, but {at} has no current replacement: {reason}",
+                            node.id
+                        ),
+                    ));
+                }
             }
         }
         for child in &node.children {
@@ -347,18 +466,25 @@ fn parse_step(line: &str) -> Option<RequirementStep> {
 }
 
 fn find_dependency_cycles(graph: &RequirementGraph) -> Vec<RequirementGraphDiagnostic> {
-    let adjacency = graph
+    // Cycles are searched on the resolved edges: a cycle that only closes
+    // through a block's current replacement still blocks scheduling.
+    let resolved = graph
         .nodes
         .iter()
         .map(|node| {
             (
                 node.id.as_str(),
-                node.dependencies
-                    .iter()
-                    .map(String::as_str)
+                graph
+                    .current_dependencies(node)
+                    .into_iter()
+                    .map(|dep| dep.id)
                     .collect::<Vec<_>>(),
             )
         })
+        .collect::<Vec<_>>();
+    let adjacency = resolved
+        .iter()
+        .map(|(id, deps)| (*id, deps.iter().map(String::as_str).collect::<Vec<_>>()))
         .collect::<BTreeMap<_, _>>();
     let mut diagnostics = Vec::new();
     let mut reported = BTreeSet::new();
@@ -497,7 +623,10 @@ fn severity_for(code: &str) -> &'static str {
         | "child-cycle"
         | "duplicate-child-parent"
         | "requirement-governance-missing" => "error",
-        "missing-title" | "missing-scenarios" | "blocked-open-questions" => "warning",
+        "missing-title"
+        | "missing-scenarios"
+        | "blocked-open-questions"
+        | "dependency-supersession-unresolved" => "warning",
         _ => "warning",
     }
 }
@@ -568,6 +697,75 @@ mod tests {
         assert!(diagnostics.iter().any(|d| d.code == "dependency-cycle"));
     }
 
+    fn write_block(dir: &Path, id: &str, status: &str, supersedes: Option<&str>, deps: &[&str]) {
+        let supersedes = supersedes
+            .map(|target| format!("supersedes: {target}\n"))
+            .unwrap_or_default();
+        let deps = deps
+            .iter()
+            .map(|dep| format!("- {dep}\n"))
+            .collect::<String>();
+        fs::write(
+            dir.join(format!("requirements/{}.md", id.to_ascii_lowercase())),
+            format!(
+                "---\nkind: requirement\nid: {id}\ntitle: \"{id}\"\nstatus: {status}\n{supersedes}---\n## Problem\n{id}.\n## Requirements\n[{id}] The service MUST do {id}.\n## Dependencies\n{deps}## Scenarios\nScenario: {id}\n  Given a precondition\n  When {id} runs\n  Then the {id} outcome is visible\n## Open Questions\nNone.\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_requirement_graph_resolves_dependencies_through_supersession() {
+        let dir = temp_dir("req-graph-supersession");
+        write_block(&dir, "REQ-P", "superseded", None, &[]);
+        write_block(
+            &dir,
+            "REQ-P-V2",
+            "accepted",
+            Some("REQ-P"),
+            &["REQ-P", "REQ-Q"],
+        );
+        write_block(&dir, "REQ-Q", "accepted", None, &["REQ-P"]);
+        write_block(&dir, "REQ-ORPHAN", "superseded", None, &[]);
+        write_block(&dir, "REQ-USER", "accepted", None, &["REQ-ORPHAN"]);
+
+        let graph = build_requirement_graph(&dir);
+        let p_v2 = graph.node("REQ-P-V2").unwrap();
+        assert_eq!(p_v2.supersedes.as_deref(), Some("REQ-P"));
+        // Declared dependencies stay as written; resolution is a view.
+        assert_eq!(graph.node("REQ-Q").unwrap().dependencies, vec!["REQ-P"]);
+        let q_deps = graph.current_dependencies(graph.node("REQ-Q").unwrap());
+        assert_eq!(q_deps.len(), 1);
+        assert_eq!(q_deps[0].id, "REQ-P-V2");
+        assert_eq!(q_deps[0].declared_as.as_deref(), Some("REQ-P"));
+        // A block that depends on its own predecessor does not depend on itself.
+        let p_v2_deps = graph.current_dependencies(p_v2);
+        assert_eq!(
+            p_v2_deps
+                .iter()
+                .map(|dep| dep.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["REQ-Q"]
+        );
+
+        let diagnostics = validate_requirement_graph(&graph);
+        let cycle = diagnostics
+            .iter()
+            .find(|d| d.code == "dependency-cycle")
+            .unwrap();
+        assert!(cycle.message.contains("REQ-P-V2"), "{}", cycle.message);
+        assert!(!diagnostics.iter().any(|d| {
+            d.code == "dependency-cycle" && d.message.contains("REQ-P-V2 -> REQ-P-V2")
+        }));
+        let unresolved = diagnostics
+            .iter()
+            .find(|d| d.code == "dependency-supersession-unresolved")
+            .unwrap();
+        assert_eq!(unresolved.requirement_id.as_deref(), Some("REQ-USER"));
+        assert_eq!(unresolved.severity, "warning");
+        assert!(unresolved.message.contains("REQ-ORPHAN"));
+    }
+
     #[test]
     fn test_requirement_graph_reports_child_cycle_and_duplicate_parent() {
         let graph = RequirementGraph {
@@ -576,6 +774,7 @@ mod tests {
                     id: "REQ-A".into(),
                     title: "A".into(),
                     status: None,
+                    supersedes: None,
                     source_path: PathBuf::from("knowledge/requirements/req-a.md"),
                     problem: "A".into(),
                     clauses: Vec::new(),
@@ -590,6 +789,7 @@ mod tests {
                     id: "REQ-B".into(),
                     title: "B".into(),
                     status: None,
+                    supersedes: None,
                     source_path: PathBuf::from("knowledge/requirements/req-b.md"),
                     problem: "B".into(),
                     clauses: Vec::new(),
@@ -604,6 +804,7 @@ mod tests {
                     id: "REQ-C".into(),
                     title: "C".into(),
                     status: None,
+                    supersedes: None,
                     source_path: PathBuf::from("knowledge/requirements/req-c.md"),
                     problem: "C".into(),
                     clauses: Vec::new(),
@@ -618,6 +819,7 @@ mod tests {
                     id: "REQ-D".into(),
                     title: "D".into(),
                     status: None,
+                    supersedes: None,
                     source_path: PathBuf::from("knowledge/requirements/req-d.md"),
                     problem: "D".into(),
                     clauses: Vec::new(),

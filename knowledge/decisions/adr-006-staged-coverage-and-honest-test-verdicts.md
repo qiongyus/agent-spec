@@ -128,4 +128,4 @@ Bad, because D7 让同一 package 的测试共享进程树，泄漏全局状态�
   `required-features`；`requirements status` 的 active / staged / archived
   三层；ADR-001 的无身份字段原则
 - 后续: 依赖指向非 Ready 块时依赖边脱离分批的既有规则，留待后续提案
-- governed requirements: 尚未拆出，由本决策的后续需求文档承接
+- governed requirements: REQ-STAGED-COVERAGE（D1）、REQ-HONEST-TEST-VERDICTS（D2、D8）、REQ-SELECTOR-FEATURES（D3）、REQ-SOAK-SCENARIOS（D4）、REQ-SUPERSESSION-DEPENDENCY-RESOLUTION（D5）、REQ-GUARD-CONTRACT-BOUNDARIES（D6）、REQ-BATCHED-TEST-EXECUTION（D7）

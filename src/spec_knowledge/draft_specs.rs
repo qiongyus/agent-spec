@@ -158,6 +158,7 @@ mod tests {
                 id: Some("REQ-101".into()),
                 keyword: Some("MUST".into()),
                 text: "The authentication service MUST create a login session.".into(),
+                group: None,
             }],
             dependencies: vec!["REQ-100".into()],
             children: Vec::new(),
@@ -177,6 +178,7 @@ mod tests {
                         content: "the system establishes a login session".into(),
                     },
                 ],
+                group: None,
             }],
             source_trace: vec!["issue:#123".into()],
             open_questions: Vec::new(),
@@ -229,6 +231,7 @@ mod tests {
             scenarios: vec![RequirementScenario {
                 name: "Escape".into(),
                 steps: Vec::new(),
+                group: None,
             }],
             source_trace: Vec::new(),
             open_questions: Vec::new(),

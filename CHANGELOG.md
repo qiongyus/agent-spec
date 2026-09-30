@@ -6,6 +6,16 @@ All notable changes to `agent-spec` are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- Clause grouping (REQ-CLAUSE-GROUPING): `###` headings inside a requirement's
+  `## Requirements` and `## Scenarios` sections are grouping labels, not
+  clauses. They no longer count toward the clause total or raise
+  `requirement-needs-id` / `requirement-bcp14-keyword`, and `requirements graph`
+  exposes the enclosing heading as an optional `group` field on each clause and
+  scenario (omitted when absent, so ungrouped documents serialize unchanged).
+  `### Rule: <id>` lines keep their clause-attribution meaning.
+
 ## [1.4.0] - 2026-08-14
 
 The **enforcement** release: the forward-walking pipeline stops reminding and

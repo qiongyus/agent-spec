@@ -141,6 +141,7 @@ mod tests {
                 id: Some(id.to_string()),
                 keyword: Some("MUST".to_string()),
                 text: format!("The system MUST satisfy {id}."),
+                group: None,
             }],
             dependencies: Vec::new(),
             children: children.into_iter().map(str::to_string).collect(),
@@ -161,6 +162,7 @@ mod tests {
                             content: "an outcome is visible".into(),
                         },
                     ],
+                    group: None,
                 })
                 .collect(),
             source_trace: Vec::new(),

@@ -44,6 +44,21 @@ agent-spec requirements import --from docs/prd.md --out knowledge/requirements
 原始散文的结构化由 `agent-spec-requirements-compiler` 技能辅助起草：候选块必须
 带源摘录、置信度、场景与打开的问题，人审后才进 import。
 
+## 块内分组：`###` 标题
+
+`## Requirements` 与 `## Scenarios` 里可以用 `###` 标题分组，表达「先总后分」
+或「主流程 → 各步分支」这类层次。标题只是标签：不计条款、不进 lint，
+`requirements graph --format json` 把它作为条款与场景的可选 `group` 字段透出，
+无分组的文档输出不变。`### Rule: <条款 id>` 仍是场景归属（第 15 章），不算分组。
+
+```markdown
+## Requirements
+### 信封
+[REQ-ERR-1] 任何 4xx 或 5xx 响应 MUST 返回 JSON 对象。
+### 映射（按校验链步序）
+[REQ-ERR-2] 未注册路径 MUST 响应 404。
+```
+
 ## YAML 方言（v1.1）
 
 对接外部生态时，`requirements.yaml` 树可以直接导入：

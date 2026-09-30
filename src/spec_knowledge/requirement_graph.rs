@@ -1,5 +1,6 @@
 //! Requirement graph extraction from KLL requirement artifacts.
 
+use crate::spec_knowledge::requirement::group_heading;
 use crate::spec_knowledge::{
     DecisionStatus, KnowledgeKind, KnowledgeParseError, NormativeKeyword,
     collect_knowledge_checked, extract_requirements,
@@ -146,12 +147,19 @@ pub struct RequirementClauseView {
     pub id: Option<String>,
     pub keyword: Option<String>,
     pub text: String,
+    /// Nearest preceding `### Group` heading in `## Requirements`, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RequirementScenario {
     pub name: String,
     pub steps: Vec<RequirementStep>,
+    /// Nearest preceding `### Group` heading in `## Scenarios`, if any.
+    /// `### Rule: <id>` lines are clause attribution, not groups.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -220,6 +228,7 @@ pub fn build_requirement_graph(knowledge_dir: &Path) -> RequirementGraph {
                         id: clause.id,
                         keyword: clause.keyword.map(normative_keyword_string),
                         text: clause.text,
+                        group: clause.group,
                     })
                     .collect(),
                 dependencies: extract_id_lines(&section_body(&doc, "Dependencies")),
@@ -419,9 +428,18 @@ fn parse_open_questions(body: &str) -> Vec<String> {
 fn parse_scenarios(body: &str) -> Vec<RequirementScenario> {
     let mut scenarios = Vec::new();
     let mut current: Option<RequirementScenario> = None;
+    let mut group: Option<String> = None;
     for raw in body.lines() {
         let line = raw.trim();
         if line.is_empty() {
+            continue;
+        }
+        if let Some(title) = group_heading(line) {
+            // `### Rule: <id>` is clause attribution (see clause coverage),
+            // not a presentational group.
+            if !title.starts_with("Rule:") {
+                group = (!title.is_empty()).then(|| title.to_string());
+            }
             continue;
         }
         if let Some(name) = line
@@ -434,6 +452,7 @@ fn parse_scenarios(body: &str) -> Vec<RequirementScenario> {
             current = Some(RequirementScenario {
                 name: name.trim().to_string(),
                 steps: Vec::new(),
+                group: group.clone(),
             });
         } else if let Some(step) = parse_step(line)
             && let Some(scenario) = current.as_mut()
@@ -649,6 +668,22 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("requirements")).unwrap();
         dir
+    }
+
+    #[test]
+    fn test_scenario_groups_follow_headings_but_rule_headings_are_attribution() {
+        let scenarios = parse_scenarios(
+            "### Envelope\nScenario: A\n  Given g\n  When w\n  Then t\n### Rule: REQ-X-ALPHA\nScenario: B\n  Given g\n  When w\n  Then t\n### Validation chain\n场景: C\n  假设 g\n  当 w\n  那么 t\n",
+        );
+        assert_eq!(scenarios.len(), 3);
+        assert_eq!(scenarios[0].group.as_deref(), Some("Envelope"));
+        assert_eq!(
+            scenarios[1].group.as_deref(),
+            Some("Envelope"),
+            "`### Rule:` keeps the enclosing group"
+        );
+        assert_eq!(scenarios[2].group.as_deref(), Some("Validation chain"));
+        assert_eq!(scenarios[2].steps.len(), 3);
     }
 
     #[test]

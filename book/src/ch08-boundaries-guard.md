@@ -32,7 +32,30 @@ agent-spec guard: 55 spec(s) passed
 
 这行输出来自 agent-spec 自己的仓库（写作时快照；活跃合同数会随仓库生长）——
 全部活跃合同在每次提交前复验。
-任何一份合同 lint 不过或验证不过，提交被阻断。
+任何一份合同 lint 不过或验证不过，提交被阻断；失败时 guard 会在该合同的汇总行下
+列出每个 `fail` / `uncertain` 场景的 selector、退出码与输出最后 40 行。
+
+### 每份合同只管自己的领地
+
+guard 不再拿整次提交的变更集去对照每一份活跃合同。一份合同的 `Forbidden` 与
+`Allowed changes` 只约束**触及其领地**的提交——某个变更命中它的允许清单，或者
+就是它的合同文件（含从 `specs/roadmap/` 晋升时的源路径）：
+
+| 提交内容 | 结果 |
+|---|---|
+| 只改文档、CI 配置，或只改 `knowledge/` 的治理提交 | 不触及任何合同，不做边界检查 |
+| 改动分属两份合同的领地 | 各自在边界内，通过 |
+| 触及某合同领地，同时夹带一个无人认领的路径 | 该路径对每份被触及的合同都算越界 |
+| 触及合同 A 的领地，同时改了 A 禁止的路径 | A 报 forbidden |
+
+`--strict-boundaries` 保留旧行为：每份合同对照整个变更集。
+
+### 批量执行
+
+绑定测试按 (package, features) 分组，guard 跨全部活跃合同合并分组，每组只调用
+一次 `cargo test --no-fail-fast -- <filter…>`，再按 libtest 的逐测试结果行把判定
+回填到各场景（测试路径包含 filter 即归属该场景）。默认 `--test-threads=1`；
+`--test-threads <N>` 调并发，`--no-batch` 退回每个场景一次 `cargo test -q`。
 
 ## `### Symbols`：把合同钉到真实符号上
 

@@ -55,11 +55,19 @@ graph TD
     S[场景] --> T1["标签: critical<br/>失败 ⇒ gate_blocked=true, exit 2"]
     S --> T2["审核: human<br/>测试过 ⇒ pending_review"]
     S --> T3["模式: optimize<br/>通过进 optimization_candidates,失败仍阻断"]
+    S --> T5["模式: soak<br/>默认不跑 ⇒ deferred;--include-soak 才跑"]
     S --> T4["前置: 另一场景名<br/>前置失败 ⇒ 本场景自动跳过"]
 ```
 
 - `critical`：必须通过的场景，CI 友好的硬门。
 - `审核: human`：测试通过后仍需人签——`--review-mode strict` 下不算通过。
+- `模式: soak`：长时运行的场景。`verify`、`lifecycle`、`guard` 默认不跑，报
+  `deferred`（auto 模式下不阻塞）；`--include-soak` 才跑，并带
+  `-- --include-ignored`，测试本身可以保持 `#[ignore]`。strict 模式与
+  `resolve-ai` 把没跑过的 soak 场景视为未通过。只写 selector 的 `级别: soak`
+  不会暂缓任何东西（lint：`soak-level-without-mode`）。
+- `特性:` / `Features:`（selector 字段）：测试所需的 cargo feature，逗号分隔，
+  透传为 `cargo test --features`。
 - `前置:` 声明场景执行顺序；循环依赖由 lint 检出。
 
 ## Rule 分组（BDD-spine）

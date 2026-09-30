@@ -35,6 +35,10 @@ risk: B
 - src/spec_gateway/**
 - src/main.rs
 - CHANGELOG.md
+- book/src/appendix-b-dsl.md
+- book/src/ch05-scenario-dsl.md
+- skills/agent-spec-authoring/SKILL.md
+- .claude/skills/agent-spec-authoring/SKILL.md
 - specs/task-selector-features.spec.md
 - specs/roadmap/task-selector-features.spec.md
 

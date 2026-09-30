@@ -65,8 +65,10 @@ honored 是 verified，归档是 archived。liveness 三值 `honored` / `violate
 
 ## 开工仪式
 
-接受一条需求意味着排期义务。plan 门会强制配对：accepted 而无活跃合同 →
-`requirement-uncovered` 失败。因此标准开工动作是一次变更里同时完成——
+接受一条需求意味着排期义务。plan 门会强制配对：accepted 而既无活跃合同、也无
+`specs/roadmap/` 下的 staged 合同 → `requirement-uncovered` 失败；只有一份
+staged 合同 → Info `requirement-staged`（已排期、尚未启用），知识门禁照样通过。
+所以规格可以领先实现一轮：先把合同放进 roadmap，开工时再晋升——
 
 ```bash
 agent-spec requirements transition REQ-X --to accepted

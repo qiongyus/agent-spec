@@ -38,6 +38,14 @@ spec lint 对 `Level: soak` 与 `Mode:` 不一致、以及未知的 `Mode:` / `R
 - src/main.rs
 - CHANGELOG.md
 - AGENTS.md
+- README.md
+- book/src/ch05-scenario-dsl.md
+- book/src/ch07-lifecycle.md
+- book/src/appendix-b-dsl.md
+- skills/agent-spec-authoring/SKILL.md
+- skills/agent-spec-tool-first/SKILL.md
+- .claude/skills/agent-spec-authoring/SKILL.md
+- .claude/skills/agent-spec-tool-first/SKILL.md
 - specs/task-soak-scenarios.spec.md
 - specs/roadmap/task-soak-scenarios.spec.md
 

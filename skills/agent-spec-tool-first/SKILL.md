@@ -493,9 +493,11 @@ Establishes Contract → Commit traceability chain.
 | `pass` | Scenario verified | No action needed |
 | `fail` | Scenario failed verification | Read evidence, fix code |
 | `skip` | Test not found or not run | Add missing test or fix selector |
-| `uncertain` | AI stub / manual review needed | Review manually or enable AI backend |
+| `uncertain` | Could not judge: no test ran (build or runner failure) or AI verification pending | Read the evidence: `failure_class` `compile-error` → fix the build; `runner-exited` → environment, retry once; AI → review manually or enable a backend |
+| `pending_review` | Test passed; the scenario declares `Review: human` | Human sign-off; `--review-mode strict` counts it as non-passing |
+| `deferred` | `Mode: soak` scenario not run by this verification | Run with `--include-soak`; `--review-mode strict` and `resolve-ai` count it as non-passing |
 
-**Key rule: `skip` != `pass`**. All five verdicts (`pass`, `fail`, `skip`, `uncertain`, `pending_review`) are distinct.
+**Key rule: `skip` != `pass`**. All six verdicts (`pass`, `fail`, `skip`, `uncertain`, `pending_review`, `deferred`) are distinct. A scenario passes only when a bound test actually executed: a filter matching only `#[ignore]`d tests is `skip` ("bound test is #[ignore]d"). guard prints each `fail` / `uncertain` scenario's selector, exit status and last 40 output lines under the failing spec.
 
 ## VCS Awareness
 

@@ -22,9 +22,11 @@
     包: my-crate
     过滤: test_name
     级别: integration
+    特性: fault-injection        # 透传为 cargo test --features
   前置: 另一场景名
   审核: human                    # 测试过 → pending_review
   模式: optimize                 # 通过进优化候选,失败仍阻断
+                                 # 或 模式: soak:默认 deferred,--include-soak 才跑
   假设 前置条件:
     | 列1 | 列2 |
     | a   | b   |

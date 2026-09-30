@@ -338,6 +338,22 @@ Scenario: Cross-crate verification
     过滤: test_contract_prompt_format
 ```
 
+## Soak Mode
+
+Long-running scenarios use `模式: soak` / `Mode: soak`. `verify`, `lifecycle` and `guard` do not run them by default and report the verdict `deferred`, which does not fail the default `auto` review mode. `--include-soak` runs them with `-- --include-ignored`. `--review-mode strict` and `resolve-ai` count an unrun soak scenario as non-passing. `Level: soak` alone defers nothing (lint: `soak-level-without-mode`).
+
+## Cargo Features
+
+A structured selector can name the cargo features its test needs: `Features:` / `特性:` (comma-separated), passed as `cargo test --features`.
+
+```spec
+场景: 崩溃注入后恢复
+  测试:
+    包: amberlog
+    过滤: test_crash_recovery
+    特性: fault-injection
+```
+
 ## Step Tables
 
 For structured inputs, use tables instead of inventing custom prose:
@@ -434,7 +450,7 @@ When authoring specs for the `agent-spec` project itself:
 - Put task specs under `specs/`
 - Roadmap specs go in `specs/roadmap/`, promote to `specs/` when active
 - Update tests when DSL or verification behavior changes
-- Preserve the four verdicts: `pass`, `fail`, `skip`, `uncertain`
+- Preserve the six verdicts: `pass`, `fail`, `skip`, `uncertain`, `pending_review`, `deferred`
 - Do not let a task spec rely on implicit test-name matching
 
 ## Escalation

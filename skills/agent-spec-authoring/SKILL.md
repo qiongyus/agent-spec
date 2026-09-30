@@ -589,6 +589,30 @@ Scenarios that represent optimization targets use `模式: optimize` / `Mode: op
   ...
 ```
 
+### Soak mode
+
+Long-running scenarios (hours-long soak tests) use `模式: soak` / `Mode: soak`. `verify`, `lifecycle` and `guard` do not run them by default; they report the verdict `deferred`, which does not fail the default `auto` review mode. `--include-soak` runs them with `-- --include-ignored`, so the test can stay `#[ignore]`d for plain `cargo test`. `--review-mode strict` and `resolve-ai` count an unrun soak scenario as non-passing. A selector's `Level: soak` alone does not defer anything — lint warns `soak-level-without-mode`; unrecognized `Mode:` / `Review:` values warn `unknown-scenario-mode` / `unknown-review-mode`.
+
+```spec
+场景: 持续摄入 24 小时不删除文件
+  模式: soak
+  测试: test_ingest_soak_24h
+  ...
+```
+
+### Cargo features
+
+A structured selector can name the cargo features its test needs: `Features:` / `特性:` (comma-separated), passed as `cargo test --features`. Use it for tests behind a test-only feature instead of a self dev-dependency.
+
+```spec
+场景: 崩溃注入后恢复
+  测试:
+    包: amberlog
+    过滤: test_crash_recovery
+    特性: fault-injection
+  ...
+```
+
 ### Scenario dependencies
 
 Use `前置:` / `Depends:` for execution order. Prerequisite fail → dependent auto-skipped.
@@ -620,7 +644,7 @@ When authoring specs for the `agent-spec` project itself:
 - Put task specs under `specs/`
 - Roadmap specs go in `specs/roadmap/`, promote to `specs/` when active
 - Update tests when DSL or verification behavior changes
-- Preserve the five verdicts: `pass`, `fail`, `skip`, `uncertain`, `pending_review`
+- Preserve the six verdicts: `pass`, `fail`, `skip`, `uncertain`, `pending_review`, `deferred`
 - Do not let a task spec rely on implicit test-name matching
 
 ## Escalation

@@ -165,8 +165,8 @@ changes only with a major version:
   test-obligations|worktrees|draft-specs|questions|replay|explain-failure|
   trace-graph|traceability|verify-run|compile|bind|bundle|affected|
   affected-bundle|affected-record`).
-- **Machine formats**: lifecycle/verify JSON top-level keys, the five verdicts
-  (`pass`, `fail`, `skip`, `uncertain`, `pending_review`) and `is_passing`
+- **Machine formats**: lifecycle/verify JSON top-level keys, the six verdicts
+  (`pass`, `fail`, `skip`, `uncertain`, `pending_review`, `deferred`) and `is_passing`
   semantics, schema `$id` URIs under `agent-spec/intent-compiler/`, the
   YAML dialect v1.1, compilation provenance manifests (v1 and the replayable
   v2 run manifests), the requirement-traceability projection, the compile
@@ -998,7 +998,7 @@ The file `specs/project.spec` defines constraints that every task spec inherits.
 
 ### Roadmap specs
 
-Future work lives in `specs/roadmap/`. These are real Task Contracts but they are not checked by the default `guard` run. When a roadmap spec is ready for implementation, promote it to the top-level `specs/` directory. See `specs/roadmap/README.md` for the promotion rule.
+Future work lives in `specs/roadmap/`. These are real Task Contracts but they are not checked by the default `guard` run. They do count as *staged* coverage: an accepted requirement whose only contract is staged reports Info `requirement-staged` instead of Error `requirement-uncovered`, so `lint-knowledge --gate` and `guard` stay green while the specification runs ahead of implementation. When a roadmap spec is ready for implementation, promote it to the top-level `specs/` directory. See `specs/roadmap/README.md` for the promotion rule.
 
 ### Using AI agents to contribute
 

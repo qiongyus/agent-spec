@@ -27,18 +27,26 @@ graph LR
 测试层**之间**（合同声明 `### Symbols` 时激活，详见第 8 章）；复杂度验证器在
 合同声明质量约束且存在变更时运行。
 
-## 五种 verdict
+## 六种 verdict
 
 | verdict | 含义 | 动作 |
 |---------|------|------|
 | `pass` | 场景被证实 | 无 |
 | `fail` | 绑定测试跑了且失败 | 读证据，修代码 |
-| `skip` | 测试没找到/没跑 | 补测试或修选择器 |
-| `uncertain` | AI 桩/待人工评审 | 人工看或接 AI 后端 |
+| `skip` | 测试没找到/没跑，或匹配到的测试全被 `#[ignore]` | 补测试或修选择器；长时测试改用 `模式: soak` |
+| `uncertain` | 没有测试跑起来（编译或 runner 失败），或 AI 桩/待人工评审 | 看证据的 `failure_class`：`compile-error` 修构建，`runner-exited` 多半是环境问题、可重试一次；AI 场景人工看或接后端 |
 | `pending_review` | 测试过了但要人签 | 走人工签核 |
+| `deferred` | `模式: soak` 场景本次没跑 | `--include-soak` 显式运行；strict 与 `resolve-ai` 视为未通过 |
 
 **skip ≠ pass** 是这套体系的第一铁律。`is_passing` 要求 total>0 且
 failed=skipped=uncertain=0——任何"没验证"都不会被静默当作"验证通过"。
+已执行数取自 libtest 的 `test result:` 汇总行：只匹配到 `#[ignore]` 测试的场景是
+`skip`，不是 `pass`。`deferred` 在默认 auto 模式下不阻塞，strict 模式下阻塞。
+
+guard 失败时，会在每个失败 spec 的汇总行下列出 `fail` / `uncertain` 场景的
+selector、退出码与输出最后 40 行，不必手工重跑来看原因。绑定测试按
+(package, features) 分组批量运行，每组一次 `cargo test`（`--no-batch` 退回逐场景，
+`--test-threads <N>` 调并发，默认 1）。
 
 ## 重试循环
 

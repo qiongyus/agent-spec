@@ -358,7 +358,7 @@ When `lifecycle` fails:
 1. Run: `agent-spec lifecycle <spec> --code . --format json`
 2. Parse JSON output, find each scenario's `verdict` and `evidence`
 3. For `fail`: the bound test ran and failed — read evidence, fix code
-4. For `skip`: test not found — check `Test:` selector matches a real test name
+4. For `skip`: test not found or only `#[ignore]`d tests matched — check `Test:` selector matches a real, non-ignored test (a long-running scenario belongs in `Mode: soak`)
 5. For `uncertain`: AI verification pending — review manually or enable AI backend
 6. **Fix code based on evidence. Do NOT modify the spec file.**
 7. Re-run lifecycle
@@ -371,9 +371,11 @@ When `lifecycle` fails:
 | `pass` | Scenario verified | No action needed |
 | `fail` | Scenario failed verification | Read evidence, fix code |
 | `skip` | Test not found or not run | Add missing test or fix selector |
-| `uncertain` | AI stub / manual review needed | Review manually or enable AI backend |
+| `uncertain` | Could not judge: no test ran (build or runner failure) or AI verification pending | Read the evidence: `failure_class` `compile-error` → fix the build; `runner-exited` → environment, retry once; AI → review manually or enable a backend |
+| `pending_review` | Test passed; the scenario declares `Review: human` | Human sign-off; `--review-mode strict` counts it as non-passing |
+| `deferred` | `Mode: soak` scenario not run by this verification | Run with `--include-soak`; `--review-mode strict` and `resolve-ai` count it as non-passing |
 
-**Key rule: `skip` != `pass`**. All four verdicts are distinct.
+**Key rule: `skip` != `pass`**. All six verdicts are distinct. A scenario passes only when a bound test actually executed: a filter that matches only `#[ignore]`d tests is `skip` ("bound test is #[ignore]d"). When guard fails, it prints each `fail` / `uncertain` scenario's selector, exit status and output tail under the spec's summary line.
 
 ### Change Set Options
 
@@ -514,7 +516,10 @@ Constraints and decisions inherit downward. Both `.spec` and `.spec.md` extensio
 
 - Task specs live in `specs/`
 - Roadmap specs go in `specs/roadmap/`, promote to `specs/` when active
-- Verdicts: pass, fail, skip, uncertain — all four are distinct
+- Verdicts: pass, fail, skip, uncertain, pending_review, deferred — all six are distinct
+- A ready requirement whose only contract sits in `specs/roadmap/` reports Info `requirement-staged`, not Error `requirement-uncovered`
+- guard holds each contract to its own boundaries: only commits that touch a contract's territory are checked against its `Allowed changes` / `Forbidden` (`--strict-boundaries` for the whole-commit check)
+- Bound tests run batched, one `cargo test` per (package, features) group (`--no-batch` for one run per scenario, `--test-threads <N>` for concurrency)
 - **skip ≠ pass**: skipped scenarios block the pipeline
 
 ### Intent Compiler Workflow

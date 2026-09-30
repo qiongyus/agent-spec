@@ -2,7 +2,7 @@
 kind: proposal
 id: LEP-007
 title: "Staged Coverage and Honest Test Verdicts"
-status: proposed
+status: accepted
 liveness: n/a
 tags: [knowledge, verify, guard, requirements]
 ---
@@ -484,7 +484,12 @@ each outcome.
 
 None.
 
-## Produces
+## Produces: ADR-006
 
-- On acceptance, mint the produced decision or requirement ids here
-  (inline form: `## Produces: ADR-NNN`).
+Accepted 2026-09-30. All eleven unresolved questions were put to the human as
+structured multiple-choice and answered; `## Resolved Questions` above lists
+the rulings, and the Decision section states them. The produced decision
+records D1–D8 as settled, including the two rulings that change the first D5
+implementation (a split resolves to every successor; an unresolved dependency
+is an Error) and the rule that a contract's boundaries apply only to commits
+that touch its territory.

@@ -13,7 +13,7 @@ description: |
 
 # Agent Spec Authoring
 
-> **Version:** 3.6.0 | **Last Updated:** 2026-08-14 | **Tracks:** agent-spec 1.4.0
+> **Version:** 3.7.0 | **Last Updated:** 2026-09-30 | **Tracks:** agent-spec 1.5.0
 
 ## Routing: What You Hold, Where It Goes
 

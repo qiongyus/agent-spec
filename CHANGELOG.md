@@ -6,6 +6,25 @@ All notable changes to `agent-spec` are documented here. Format follows
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-09-30
+
+The **honest verdicts** release (LEP-007 → ADR-006): a green gate means the
+contract holds, and the gates stay usable while the specification runs one
+round ahead of implementation. Staged `specs/roadmap/` contracts count as
+scheduled coverage, a scenario whose bound test did not run is never a pass,
+long-running scenarios get `Mode: soak`, selectors can request cargo
+features, guard checks each contract against the changes that concern it,
+explains every non-passing verdict, and runs bound tests batched per package.
+
+**Upgrade notes.** A spec that was green only because its bound test is
+`#[ignore]`d turns red (`skip`). A `## Dependencies` entry naming a
+superseded block with no successor, or a looping `supersedes:` chain, now
+fails the knowledge gate. guard no longer boundary-checks commits that touch
+no contract's territory (`--strict-boundaries` restores the old check), and
+runs tests batched (`--no-batch` restores one run per scenario). Pin 1.5.0
+before writing `Mode: soak`: older versions run such a scenario as a
+standard one.
+
 ### Added
 
 - Clause grouping (REQ-CLAUSE-GROUPING): `###` headings inside a requirement's

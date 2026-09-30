@@ -11,7 +11,7 @@ description: |
 
 # Agent Spec Estimate
 
-> **Version:** 1.3.1 | **Last Updated:** 2026-08-14 | **Tracks:** agent-spec 1.4.0
+> **Version:** 1.3.1 | **Last Updated:** 2026-09-30 | **Tracks:** agent-spec 1.5.0
 
 You are an expert at estimating AI agent work effort from structured Task Contracts. Help users by:
 - **Estimating specs**: Read a `.spec`/`.spec.md` file and produce a round-based effort estimate

@@ -866,6 +866,42 @@ mod tests {
     }
 
     #[test]
+    fn test_requirement_plan_orders_split_dependents_after_every_successor() {
+        let dir = make_temp_dir("requirement-plan-split");
+        let knowledge = dir.join("knowledge");
+        let specs = dir.join("specs");
+        fs::create_dir_all(knowledge.join("requirements")).unwrap();
+        fs::create_dir_all(&specs).unwrap();
+        write_requirement(&knowledge, "REQ-X", "superseded", None, &[]);
+        write_requirement(&knowledge, "REQ-X-A", "accepted", Some("REQ-X"), &[]);
+        write_requirement(
+            &knowledge,
+            "REQ-X-B",
+            "accepted",
+            Some("REQ-X"),
+            &["REQ-X-A"],
+        );
+        write_requirement(&knowledge, "REQ-C", "accepted", None, &["REQ-X"]);
+
+        let plan = build_requirement_plan(&knowledge, &specs);
+        let batch_of = |id: &str| {
+            plan.batches
+                .iter()
+                .find(|batch| batch.requirement_ids.iter().any(|r| r == id))
+                .map(|batch| batch.order)
+                .unwrap()
+        };
+        assert!(batch_of("REQ-C") > batch_of("REQ-X-B"));
+        let c = plan
+            .work_units
+            .iter()
+            .find(|unit| unit.requirement_id == "REQ-C")
+            .unwrap();
+        assert_eq!(c.depends_on, vec!["REQ-X-A", "REQ-X-B"]);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn test_requirement_plan_treats_superseded_requirements_and_roadmap_specs_as_inactive() {
         let dir = make_temp_dir("requirement-plan-active-set");
         let knowledge = dir.join("knowledge");

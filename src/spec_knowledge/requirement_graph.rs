@@ -24,29 +24,33 @@ impl RequirementGraph {
     }
 
     /// `node`'s `## Dependencies`, each resolved through `supersedes:` to the
-    /// block that is current today. A dependency on a superseded block is
-    /// followed forward until it reaches a block that is not itself
-    /// superseded (a proposed successor never replaces an accepted one).
-    /// Dependencies that cannot be resolved stay as declared; a dependency
-    /// that resolves to `node` itself (its own predecessor) is dropped.
+    /// blocks that are current today. A dependency on a superseded block is
+    /// followed forward until it reaches blocks that are not themselves
+    /// superseded (a proposed successor never replaces an accepted one); a
+    /// block superseded by several blocks was split, and resolves to every
+    /// successor. Dependencies that cannot be resolved stay as declared; a
+    /// dependency that resolves to `node` itself (its own predecessor) is
+    /// dropped.
     pub fn current_dependencies(&self, node: &RequirementNode) -> Vec<ResolvedDependency> {
         let successors = self.successors();
         let mut out: Vec<ResolvedDependency> = Vec::new();
         for dep in &node.dependencies {
-            let id = match self.follow_supersession(dep, &successors) {
-                Supersession::Current(id) => id,
-                Supersession::Unresolved { .. } => dep.clone(),
+            let ids = match self.follow_supersession(dep, &successors) {
+                Supersession::Current(ids) => ids,
+                Supersession::Unresolved { .. } => vec![dep.clone()],
             };
-            if id.eq_ignore_ascii_case(&node.id) {
-                continue;
-            }
-            let declared_as = (!id.eq_ignore_ascii_case(dep)).then(|| dep.clone());
-            match out.iter_mut().find(|existing| existing.id == id) {
-                // Declared both directly and through a predecessor: the
-                // direct declaration wins.
-                Some(existing) if declared_as.is_none() => existing.declared_as = None,
-                Some(_) => {}
-                None => out.push(ResolvedDependency { id, declared_as }),
+            for id in ids {
+                if id.eq_ignore_ascii_case(&node.id) {
+                    continue;
+                }
+                let declared_as = (!id.eq_ignore_ascii_case(dep)).then(|| dep.clone());
+                match out.iter_mut().find(|existing| existing.id == id) {
+                    // Declared both directly and through a predecessor: the
+                    // direct declaration wins.
+                    Some(existing) if declared_as.is_none() => existing.declared_as = None,
+                    Some(_) => {}
+                    None => out.push(ResolvedDependency { id, declared_as }),
+                }
             }
         }
         out.sort_by(|a, b| a.id.cmp(&b.id));
@@ -72,39 +76,57 @@ impl RequirementGraph {
         requirement_id: &str,
         successors: &BTreeMap<String, Vec<&str>>,
     ) -> Supersession {
-        let mut current = requirement_id.to_string();
-        let mut seen = BTreeSet::new();
-        loop {
-            // A missing id is `dangling-dependency`, reported separately.
-            let Some(node) = self.node(&current) else {
-                return Supersession::Current(current);
-            };
-            if node.status != Some(DecisionStatus::Superseded) {
-                return Supersession::Current(node.id.clone());
-            }
-            let key = node.id.to_ascii_uppercase();
-            if !seen.insert(key.clone()) {
-                return Supersession::Unresolved {
-                    at: node.id.clone(),
-                    reason: "its `supersedes:` chain loops".to_string(),
-                };
-            }
-            match successors.get(&key).map(Vec::as_slice) {
-                Some([next]) => current = (*next).to_string(),
-                None | Some([]) => {
-                    return Supersession::Unresolved {
-                        at: node.id.clone(),
-                        reason: "no block declares `supersedes:` for it".to_string(),
-                    };
-                }
-                Some(many) => {
-                    return Supersession::Unresolved {
-                        at: node.id.clone(),
-                        reason: format!("it is superseded by several blocks: {}", many.join(", ")),
-                    };
-                }
-            }
+        let mut current = Vec::new();
+        if let Err(unresolved) =
+            self.follow_branch(requirement_id, successors, &mut Vec::new(), &mut current)
+        {
+            return unresolved;
         }
+        current.sort();
+        current.dedup();
+        Supersession::Current(current)
+    }
+
+    /// Follow one branch of a `supersedes:` chain depth-first, collecting the
+    /// current blocks it reaches. `path` holds the superseded ids on this
+    /// branch, so a loop is detected per branch and a split whose branches
+    /// rejoin is not mistaken for one.
+    fn follow_branch(
+        &self,
+        requirement_id: &str,
+        successors: &BTreeMap<String, Vec<&str>>,
+        path: &mut Vec<String>,
+        current: &mut Vec<String>,
+    ) -> Result<(), Supersession> {
+        // A missing id is `dangling-dependency`, reported separately.
+        let Some(node) = self.node(requirement_id) else {
+            current.push(requirement_id.to_string());
+            return Ok(());
+        };
+        if node.status != Some(DecisionStatus::Superseded) {
+            current.push(node.id.clone());
+            return Ok(());
+        }
+        let key = node.id.to_ascii_uppercase();
+        if path.contains(&key) {
+            return Err(Supersession::Unresolved {
+                at: node.id.clone(),
+                reason: "its `supersedes:` chain loops".to_string(),
+            });
+        }
+        let next = successors.get(&key).map(Vec::as_slice).unwrap_or_default();
+        if next.is_empty() {
+            return Err(Supersession::Unresolved {
+                at: node.id.clone(),
+                reason: "no block declares `supersedes:` for it".to_string(),
+            });
+        }
+        path.push(key);
+        for successor in next {
+            self.follow_branch(successor, successors, path, current)?;
+        }
+        path.pop();
+        Ok(())
     }
 }
 
@@ -119,7 +141,7 @@ pub struct ResolvedDependency {
 }
 
 enum Supersession {
-    Current(String),
+    Current(Vec<String>),
     Unresolved { at: String, reason: String },
 }
 
@@ -641,11 +663,9 @@ fn severity_for(code: &str) -> &'static str {
         | "dependency-cycle"
         | "child-cycle"
         | "duplicate-child-parent"
-        | "requirement-governance-missing" => "error",
-        "missing-title"
-        | "missing-scenarios"
-        | "blocked-open-questions"
-        | "dependency-supersession-unresolved" => "warning",
+        | "requirement-governance-missing"
+        | "dependency-supersession-unresolved" => "error",
+        "missing-title" | "missing-scenarios" | "blocked-open-questions" => "warning",
         _ => "warning",
     }
 }
@@ -792,13 +812,99 @@ mod tests {
         assert!(!diagnostics.iter().any(|d| {
             d.code == "dependency-cycle" && d.message.contains("REQ-P-V2 -> REQ-P-V2")
         }));
-        let unresolved = diagnostics
-            .iter()
-            .find(|d| d.code == "dependency-supersession-unresolved")
-            .unwrap();
-        assert_eq!(unresolved.requirement_id.as_deref(), Some("REQ-USER"));
-        assert_eq!(unresolved.severity, "warning");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code == "dependency-supersession-unresolved"
+                    && d.requirement_id.as_deref() == Some("REQ-USER")),
+            "REQ-ORPHAN has no successor"
+        );
+    }
+
+    fn unresolved_for<'a>(
+        diagnostics: &'a [RequirementGraphDiagnostic],
+        requirement_id: &str,
+    ) -> Option<&'a RequirementGraphDiagnostic> {
+        diagnostics.iter().find(|d| {
+            d.code == "dependency-supersession-unresolved"
+                && d.requirement_id.as_deref() == Some(requirement_id)
+        })
+    }
+
+    #[test]
+    fn test_requirement_graph_resolves_split_supersession_to_every_successor() {
+        let dir = temp_dir("req-graph-split");
+        write_block(&dir, "REQ-X", "superseded", None, &[]);
+        write_block(&dir, "REQ-X-A", "accepted", Some("REQ-X"), &[]);
+        write_block(&dir, "REQ-X-B", "accepted", Some("REQ-X"), &[]);
+        write_block(&dir, "REQ-C", "accepted", None, &["REQ-X"]);
+
+        let graph = build_requirement_graph(&dir);
+        let deps = graph.current_dependencies(graph.node("REQ-C").unwrap());
+        assert_eq!(
+            deps.iter().map(|dep| dep.id.as_str()).collect::<Vec<_>>(),
+            vec!["REQ-X-A", "REQ-X-B"]
+        );
+        assert!(
+            deps.iter()
+                .all(|dep| dep.declared_as.as_deref() == Some("REQ-X"))
+        );
+        let diagnostics = validate_requirement_graph(&graph);
+        assert!(unresolved_for(&diagnostics, "REQ-C").is_none());
+    }
+
+    #[test]
+    fn test_requirement_graph_reports_unresolved_supersession_as_error() {
+        let dir = temp_dir("req-graph-unresolved-error");
+        write_block(&dir, "REQ-ORPHAN", "superseded", None, &[]);
+        write_block(&dir, "REQ-USER", "accepted", None, &["REQ-ORPHAN"]);
+
+        let graph = build_requirement_graph(&dir);
+        let diagnostics = validate_requirement_graph(&graph);
+        let unresolved = unresolved_for(&diagnostics, "REQ-USER").unwrap();
+        assert_eq!(unresolved.severity, "error");
         assert!(unresolved.message.contains("REQ-ORPHAN"));
+        let deps = graph.current_dependencies(graph.node("REQ-USER").unwrap());
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].id, "REQ-ORPHAN");
+        assert_eq!(deps[0].declared_as, None);
+    }
+
+    #[test]
+    fn test_requirement_graph_reports_looping_supersession_as_error() {
+        let dir = temp_dir("req-graph-loop-error");
+        write_block(&dir, "REQ-L1", "superseded", Some("REQ-L2"), &[]);
+        write_block(&dir, "REQ-L2", "superseded", Some("REQ-L1"), &[]);
+        write_block(&dir, "REQ-USER", "accepted", None, &["REQ-L1"]);
+
+        let graph = build_requirement_graph(&dir);
+        let diagnostics = validate_requirement_graph(&graph);
+        let unresolved = unresolved_for(&diagnostics, "REQ-USER").unwrap();
+        assert_eq!(unresolved.severity, "error");
+        assert!(
+            unresolved.message.contains("loops"),
+            "{}",
+            unresolved.message
+        );
+    }
+
+    #[test]
+    fn test_requirement_graph_reports_split_with_dead_branch_as_error() {
+        let dir = temp_dir("req-graph-split-dead-branch");
+        write_block(&dir, "REQ-X", "superseded", None, &[]);
+        write_block(&dir, "REQ-X-A", "accepted", Some("REQ-X"), &[]);
+        write_block(&dir, "REQ-X-B", "superseded", Some("REQ-X"), &[]);
+        write_block(&dir, "REQ-C", "accepted", None, &["REQ-X"]);
+
+        let graph = build_requirement_graph(&dir);
+        let diagnostics = validate_requirement_graph(&graph);
+        let unresolved = unresolved_for(&diagnostics, "REQ-C").unwrap();
+        assert_eq!(unresolved.severity, "error");
+        assert!(
+            unresolved.message.contains("REQ-X-B"),
+            "{}",
+            unresolved.message
+        );
     }
 
     #[test]

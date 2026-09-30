@@ -27,6 +27,20 @@ All notable changes to `agent-spec` are documented here. Format follows
   (omitted when empty), and `requirements test-obligations` takes a single
   staged contract as the obligation source, marked `tier: "staged"`.
 
+### Changed
+
+- Supersession dependency resolution (LEP-007 → ADR-006 →
+  REQ-SUPERSESSION-DEPENDENCY-RESOLUTION): a `## Dependencies` entry naming a
+  superseded block resolves forward along `supersedes:` to the block that is
+  current today, so `requirements plan` batches, `work-units` `depends_on` and
+  `dependency-cycle` detection follow the replacement instead of silently
+  dropping the edge. A proposed successor never replaces an accepted block; a
+  block superseded by several blocks (a split) resolves to every successor.
+  Plan edges rewritten this way carry `declared_as`, and graph nodes expose
+  `supersedes`; declared ids stay as written, so `requirements export` still
+  round-trips. A superseded dependency with no successor, or on a looping
+  `supersedes:` chain, is the new Error `dependency-supersession-unresolved`.
+
 ## [1.4.0] - 2026-08-14
 
 The **enforcement** release: the forward-walking pipeline stops reminding and

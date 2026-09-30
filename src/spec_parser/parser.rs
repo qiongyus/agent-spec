@@ -471,6 +471,7 @@ fn parse_scenarios(lines: &[(usize, &str)], rule_scope: &RuleScope) -> SpecResul
                     TestSelectorField::Level => draft.level = Some(value.to_string()),
                     TestSelectorField::TestDouble => draft.test_double = Some(value.to_string()),
                     TestSelectorField::Targets => draft.targets = Some(value.to_string()),
+                    TestSelectorField::Features => draft.features = Some(value.to_string()),
                 }
                 continue;
             }
@@ -574,6 +575,7 @@ struct TestSelectorDraft {
     level: Option<String>,
     test_double: Option<String>,
     targets: Option<String>,
+    features: Option<String>,
 }
 
 fn finalize_test_selector(
@@ -597,6 +599,7 @@ fn finalize_test_selector(
         level: draft.level,
         test_double: draft.test_double,
         targets: draft.targets,
+        features: draft.features,
     }))
 }
 
@@ -978,6 +981,44 @@ name: "结构化绑定"
         assert!(json.contains("\"spec-parser\""));
         assert!(json.contains("\"filter\""));
         assert!(json.contains("test_parse_structured_test_selector_block"));
+    }
+
+    #[test]
+    fn test_parse_selector_features_field_in_both_languages() {
+        let input = r#"spec: task
+name: "特性"
+---
+
+## Completion Criteria
+
+Scenario: english features
+  Test:
+    Filter: crash_recovery
+    Features: fault-injection,slow-io
+  Given a feature-gated test
+  When the spec is parsed
+  Then the selector keeps its features
+
+场景: 中文特性
+  测试:
+    过滤: crash_recovery
+    特性：fault-injection
+  假设 一个依赖 feature 的测试
+  当 解析该 spec
+  那么 selector 保留 features
+"#;
+        let doc = parse_spec_from_str(input).unwrap();
+        let Section::AcceptanceCriteria { scenarios, .. } = &doc.sections[0] else {
+            panic!("expected AcceptanceCriteria");
+        };
+        let features = scenarios
+            .iter()
+            .map(|scenario| scenario.test_selector.as_ref().unwrap().features.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            features,
+            vec![Some("fault-injection,slow-io"), Some("fault-injection")]
+        );
     }
 
     #[test]

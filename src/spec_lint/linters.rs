@@ -473,6 +473,46 @@ impl SpecLinter for ExplicitTestBindingLinter {
     }
 }
 
+/// A `Features:` / `特性:` selector field with no value: the verifier passes no
+/// `--features` for it, which is almost never what the author meant.
+pub struct EmptySelectorFeaturesLinter;
+
+impl SpecLinter for EmptySelectorFeaturesLinter {
+    fn name(&self) -> &str {
+        "selector-features-empty"
+    }
+
+    fn lint(&self, doc: &SpecDocument) -> Vec<LintDiagnostic> {
+        let mut diags = Vec::new();
+        for section in &doc.sections {
+            if let Section::AcceptanceCriteria { scenarios, .. } = section {
+                for scenario in scenarios {
+                    let empty = scenario
+                        .test_selector
+                        .as_ref()
+                        .and_then(|selector| selector.features.as_deref())
+                        .is_some_and(|features| features.trim().is_empty());
+                    if empty {
+                        diags.push(LintDiagnostic {
+                            rule: "selector-features-empty".into(),
+                            severity: Severity::Warning,
+                            message: format!(
+                                "scenario '{}' declares `Features:` with no value; no --features is passed",
+                                scenario.name
+                            ),
+                            span: scenario.span,
+                            suggestion: Some(
+                                "list the cargo features the test needs, e.g. `Features: fault-injection`, or remove the field".into(),
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        diags
+    }
+}
+
 // =============================================================================
 // 8. ScenarioPresenceLinter
 // =============================================================================

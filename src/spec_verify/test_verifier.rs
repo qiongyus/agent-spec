@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use crate::spec_core::{
     Evidence, ReviewMode, Scenario, ScenarioResult, SpecError, SpecResult, StepVerdict,
-    TestSelector, Verdict,
+    TestOutputDetail, TestSelector, Verdict,
 };
 
 use super::{VerificationContext, Verifier};
@@ -111,15 +111,11 @@ impl Verifier for TestVerifier {
                 scenario_name: scenario.name.clone(),
                 verdict,
                 step_results,
-                evidence: vec![Evidence::TestOutput {
-                    test_name: selector_label,
-                    stdout: combined,
-                    passed: output.status.success() && executed_tests > 0,
-                    package: binding.selector.package.clone(),
-                    level: binding.selector.level.clone(),
-                    test_double: binding.selector.test_double.clone(),
-                    targets: binding.selector.targets.clone(),
-                }],
+                evidence: vec![test_output_evidence(
+                    &binding.selector,
+                    combined,
+                    output.status.success() && executed_tests > 0,
+                )],
                 duration_ms,
                 provenance: None,
             });
@@ -199,8 +195,37 @@ fn build_cargo_test_args(selector: &TestSelector) -> Vec<String> {
         args.push("-p".to_string());
         args.push(package.clone());
     }
+    if let Some(features) = selector_features(selector) {
+        args.push("--features".to_string());
+        args.push(features.to_string());
+    }
     args.push(selector.filter.clone());
     args
+}
+
+/// The selector's `Features:` value, or `None` when absent or blank (a blank
+/// value is a lint warning, never an empty `--features` argument).
+fn selector_features(selector: &TestSelector) -> Option<&str> {
+    selector
+        .features
+        .as_deref()
+        .map(str::trim)
+        .filter(|features| !features.is_empty())
+}
+
+fn test_output_evidence(selector: &TestSelector, stdout: String, passed: bool) -> Evidence {
+    Evidence::TestOutput {
+        test_name: selector.label(),
+        stdout,
+        passed,
+        package: selector.package.clone(),
+        level: selector.level.clone(),
+        test_double: selector.test_double.clone(),
+        targets: selector.targets.clone(),
+        detail: TestOutputDetail {
+            features: selector_features(selector).map(str::to_string),
+        },
+    }
 }
 
 fn cargo_test_executed_count(output: &str) -> usize {
@@ -320,8 +345,74 @@ mod tests {
 
     use super::{
         BindingSource, build_cargo_test_args, cargo_test_executed_count, extract_bindings,
-        resolve_test_binding, test_run_verdict,
+        resolve_test_binding, test_output_evidence, test_run_verdict,
     };
+
+    fn selector(package: Option<&str>, features: Option<&str>) -> TestSelector {
+        TestSelector {
+            package: package.map(str::to_string),
+            features: features.map(str::to_string),
+            ..TestSelector::filter_only("crash_recovery")
+        }
+    }
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn test_build_cargo_test_args_appends_features() {
+        assert_eq!(
+            build_cargo_test_args(&selector(Some("amberlog"), Some("fault-injection"))),
+            strings(&[
+                "test",
+                "-q",
+                "-p",
+                "amberlog",
+                "--features",
+                "fault-injection",
+                "crash_recovery"
+            ])
+        );
+    }
+
+    #[test]
+    fn test_build_cargo_test_args_without_features_is_unchanged() {
+        assert_eq!(
+            build_cargo_test_args(&selector(Some("amberlog"), None)),
+            strings(&["test", "-q", "-p", "amberlog", "crash_recovery"])
+        );
+    }
+
+    #[test]
+    fn test_empty_selector_features_warns_and_passes_no_flag() {
+        let args = build_cargo_test_args(&selector(None, Some("  ")));
+        assert!(!args.iter().any(|arg| arg == "--features"), "{args:?}");
+
+        let doc = crate::spec_parser::parse_spec_from_str(
+            "spec: task\nname: \"Empty\"\n---\n\n## Completion Criteria\n\nScenario: empty features\n  Test:\n    Filter: crash_recovery\n    Features:\n  Given a selector\n  When it is linted\n  Then a warning is reported\n",
+        )
+        .unwrap();
+        let report = crate::spec_lint::LintPipeline::with_defaults().run(&doc);
+        let empty = report
+            .diagnostics
+            .iter()
+            .filter(|diag| diag.rule == "selector-features-empty")
+            .collect::<Vec<_>>();
+        assert_eq!(empty.len(), 1);
+        assert_eq!(empty[0].severity, crate::spec_core::Severity::Warning);
+    }
+
+    #[test]
+    fn test_test_output_evidence_records_selector_features() {
+        let with = test_output_evidence(&selector(None, Some("probe")), String::new(), true);
+        let json = serde_json::to_value(&with).unwrap();
+        assert_eq!(json["features"], "probe");
+
+        let without = test_output_evidence(&selector(None, None), String::new(), true);
+        let json = serde_json::to_value(&without).unwrap();
+        assert!(json.get("features").is_none());
+    }
 
     #[test]
     fn test_cargo_test_executed_count_distinguishes_zero_match_from_mixed_targets() {
@@ -450,6 +541,7 @@ fn helper() {}
             level: None,
             test_double: None,
             targets: None,
+            features: None,
         };
 
         let args = build_cargo_test_args(&selector);

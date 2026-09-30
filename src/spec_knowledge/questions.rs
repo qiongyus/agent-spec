@@ -244,6 +244,7 @@ fn serialize_verification_evidence(evidence: &crate::spec_core::Evidence) -> Str
             level,
             test_double,
             targets,
+            detail,
         } => crate::spec_core::Evidence::TestOutput {
             test_name: test_name.clone(),
             stdout: normalize_cargo_test_output(stdout),
@@ -252,6 +253,7 @@ fn serialize_verification_evidence(evidence: &crate::spec_core::Evidence) -> Str
             level: level.clone(),
             test_double: test_double.clone(),
             targets: targets.clone(),
+            detail: detail.clone(),
         },
         other => other.clone(),
     };
@@ -803,6 +805,7 @@ mod tests {
                 level: None,
                 test_double: None,
                 targets: None,
+                detail: Default::default(),
             }
         }
 

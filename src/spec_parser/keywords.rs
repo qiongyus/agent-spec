@@ -186,6 +186,7 @@ pub enum TestSelectorField {
     Level,
     TestDouble,
     Targets,
+    Features,
 }
 
 /// Structured fields under a `Test:` / `测试:` selector block.
@@ -222,6 +223,12 @@ pub fn match_test_selector_field(line: &str) -> Option<(TestSelectorField, &str)
     {
         return Some((TestSelectorField::Targets, rest.trim()));
     }
+    if let Some(rest) = trimmed
+        .strip_prefix("特性:")
+        .or_else(|| trimmed.strip_prefix("特性："))
+    {
+        return Some((TestSelectorField::Features, rest.trim()));
+    }
 
     let lower = trimmed.to_lowercase();
     if lower.starts_with("package:") {
@@ -246,6 +253,12 @@ pub fn match_test_selector_field(line: &str) -> Option<(TestSelectorField, &str)
         return Some((
             TestSelectorField::Targets,
             trimmed["targets:".len()..].trim(),
+        ));
+    }
+    if lower.starts_with("features:") {
+        return Some((
+            TestSelectorField::Features,
+            trimmed["features:".len()..].trim(),
         ));
     }
 

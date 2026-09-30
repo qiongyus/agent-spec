@@ -16,7 +16,7 @@ risk: B
 - `TestSelector` 新增 `features: Option<String>`（`skip_serializing_if = "Option::is_none"`），`TestSelector::filter_only` 与所有构造点置 `None`。
 - `keywords.rs` 新增 `TestSelectorField::Features`：识别 `Features:`（大小写不敏感）、`特性:` 与 `特性：`。
 - `build_cargo_test_args`：features 非空时在 `-p` 之后、filter 之前追加 `--features` 与原值；值为空（trim 后）时不追加。
-- `Evidence::TestOutput` 新增 `features: Option<String>`（`skip_serializing_if = "Option::is_none"`），记录声明的值。
+- `Evidence::TestOutput` 新增 `#[serde(flatten)] detail: TestOutputDetail`，其中 `features: Option<String>`（`skip_serializing_if = "Option::is_none"`）记录声明的值；JSON 形状不变，后续运行细节字段都加在 `TestOutputDetail` 上。
 - 新增 spec linter `EmptySelectorFeaturesLinter`，规则名 `selector-features-empty`，级别 Warning，对 `Features:` 值为空的场景各报一条。
 
 ## Boundaries
@@ -30,6 +30,8 @@ risk: B
 - src/spec_lint/linters.rs
 - src/spec_lint/pipeline.rs
 - src/spec_report/**
+- src/spec_knowledge/questions.rs
+- src/spec_knowledge/trace_ledger.rs
 - src/spec_gateway/**
 - src/main.rs
 - CHANGELOG.md

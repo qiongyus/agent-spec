@@ -317,6 +317,10 @@ pub struct TestSelector {
     pub test_double: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub targets: Option<String>,
+    /// Cargo features the bound test needs (`Features:` / `特性:`),
+    /// comma-separated in cargo syntax.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub features: Option<String>,
 }
 
 impl TestSelector {
@@ -327,6 +331,7 @@ impl TestSelector {
             level: None,
             test_double: None,
             targets: None,
+            features: None,
         }
     }
 

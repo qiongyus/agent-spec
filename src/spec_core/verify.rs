@@ -85,6 +85,16 @@ pub struct StepVerdict {
     pub reason: String,
 }
 
+/// Optional details of one test run, flattened into [`Evidence::TestOutput`].
+/// Every field is omitted when empty, so evidence without details serializes
+/// exactly as before.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestOutputDetail {
+    /// Cargo features the selector requested (`Features:` / `特性:`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub features: Option<String>,
+}
+
 /// Evidence supporting a verification verdict.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -101,6 +111,9 @@ pub enum Evidence {
         test_double: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         targets: Option<String>,
+        /// Optional run details, serialized inline with the fields above.
+        #[serde(flatten)]
+        detail: TestOutputDetail,
     },
     CodeSnippet {
         file: String,

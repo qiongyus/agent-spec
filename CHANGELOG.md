@@ -26,6 +26,14 @@ All notable changes to `agent-spec` are documented here. Format follows
   `requirement-staged-and-active`. Plan coverage gains `staged_spec_paths`
   (omitted when empty), and `requirements test-obligations` takes a single
   staged contract as the obligation source, marked `tier: "staged"`.
+- Test selector features (LEP-007 → ADR-006 → REQ-SELECTOR-FEATURES): a
+  structured selector accepts `Features:` / `特性:` (comma-separated cargo
+  features), passed to `cargo test` as `--features` so a contract test behind
+  a test-only feature is compiled and run under guard instead of reporting
+  `running 0 tests` → `skip`. Test evidence records the features; a blank
+  `Features:` value passes no flag and raises the spec lint warning
+  `selector-features-empty`. Selectors without the field run exactly as
+  before.
 
 ### Changed
 

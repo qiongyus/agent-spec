@@ -197,6 +197,8 @@ text format and must be re-derived by every adopter.
 `lint-knowledge` forwards the new diagnostics like the existing ones.
 `test-obligations` lists staged specs as the obligation source when no active
 spec exists, marked `staged`, so unimplemented obligations stay visible.
+Staged coverage is on by default, as the README already describes
+`specs/roadmap/`; there is no opt-in flag.
 
 **D2. Ignored is not executed.** `test_run_verdict` takes the per-binary
 `test result:` summary instead of `running N tests`: executed = passed +
@@ -222,13 +224,23 @@ with `--review-mode strict`) treat a deferred soak scenario as non-passing
 unless it has a recorded result, so a release gate cannot close on an unrun
 soak test.
 
+`Mode:` is the only field that defers a scenario. The selector's free-form
+`Level:` value stays descriptive; `agent-spec lint` warns
+`soak-level-without-mode` when a selector says `Level: soak` and its scenario
+does not say `Mode: soak`, so the two statements cannot drift apart. In the
+same change, `lint` warns `unknown-scenario-mode` and `unknown-review-mode` for
+any `Mode:` / `Review:` value it does not recognise, instead of silently mapping
+it to `Standard` / `Auto`, so the next extension of either field is not silent.
+
 **D5. Dependencies resolve through supersession.** `RequirementNode` carries
 `supersedes`. `RequirementGraph::current_dependencies` resolves each
 `## Dependencies` id: while the named block is `status: superseded`, follow the
-unique block whose `supersedes:` names it; stop at the first block that is not
+blocks whose `supersedes:` names it; stop at the first block that is not
 itself superseded. So `REQ-X` (superseded) → `REQ-X-V2` (accepted) →
 `REQ-X-V3` (proposed) resolves to `REQ-X-V2`: a proposed successor never
-replaces an accepted block. The declared ids stay as written in the graph
+replaces an accepted block. A superseded block with several successors was
+split, and a dependency on it resolves to every successor, each followed by
+the same rule. The declared ids stay as written in the graph
 (`requirements export` round-trips them unchanged); resolution is a view used
 by:
 
@@ -242,27 +254,36 @@ by:
   its blocks from every batch.
 
 A dependency that resolves to the depending block itself (it named its own
-predecessor) is dropped. A superseded block with no successor, with more than
-one successor, or on a looping `supersedes:` chain stays unresolved: the edge
-keeps its declared id (and, as today, drops out of batching), and the graph
-reports the new Warning `dependency-supersession-unresolved` on each
-non-superseded dependent. `references-superseded` is unchanged: resolution
+predecessor) is dropped. A superseded block with no successor, or on a looping
+`supersedes:` chain, stays unresolved: the edge keeps its declared id (and, as
+today, drops out of batching), and the graph reports the new Error
+`dependency-supersession-unresolved` on each non-superseded dependent — an
+Error, because a batch list that is silently wrong is what this decision
+exists to remove. `references-superseded` is unchanged: resolution
 keeps the plan correct, and the lint still asks authors to update the
 declaration.
 
 **D6. Guard checks boundaries per contract, against the changes that concern it.**
 `cmd_guard` stops applying every contract's boundaries to the whole change set.
-A changed path is checked against a contract's `Forbidden` list always (a
-forbidden path stays forbidden no matter which work touched it), but against
-its `Allowed changes` list only when the path is *attributed* to that contract.
-A path is attributed to a contract when it matches that contract's allow-list,
-when it is the contract file itself (or its move source, for a rename out of
-`specs/roadmap/`), or when the commit changes no other active contract and the
-path matches no contract's allow-list. A path matched by no active contract's
-allow-list and not attributable is reported once, as the Warning
-`change-unowned`, instead of once per contract as an Error.
-`guard --strict-boundaries` keeps today's behavior for workspaces that want
-every commit to stay inside every contract.
+A contract's boundaries — `Forbidden` and `Allowed changes` alike — apply only
+to a commit that *touches its territory*: at least one changed path matches
+the contract's allow-list, or is the contract file itself (or its move source,
+for a rename out of `specs/roadmap/`). For each touched contract:
+
+- every changed path is checked against its `Forbidden` list, so an
+  implementation commit still cannot edit what the contract forbids;
+- a changed path is checked against its `Allowed changes` list when the path
+  is *attributed* to it: the path matches that allow-list, is the contract file
+  or its move source, or matches no active contract's allow-list at all
+  (*unowned*).
+
+An unowned path in a commit that touches any contract's territory is therefore
+out of bounds for each touched contract, with the same Error as today; a
+multi-contract commit is held to the same rule as a single-contract one. A
+commit that touches no contract's territory — documentation, CI configuration,
+a governance commit that only edits `knowledge/` — is not boundary-checked and
+passes silently. `guard --strict-boundaries` keeps today's behavior for
+workspaces that want every commit to stay inside every contract.
 
 **D7. Batch test selectors per package.** Before verifying, guard (and
 `lifecycle` / `verify` over several scenarios) groups the bound selectors by
@@ -280,8 +301,11 @@ divided evenly and flagged as estimated. Isolation stays the default:
 the batched run passes `--test-threads=1` unless the new flag
 `--test-threads <N>` (or a `[verify] test_threads` setting) says otherwise,
 so tests validated one at a time are not suddenly run concurrently; the
-per-invocation overhead disappears either way. `--no-batch` keeps the
-current one-invocation-per-scenario behavior.
+per-invocation overhead disappears either way. Batching is the default from
+the release that ships it; `--no-batch` keeps the current
+one-invocation-per-scenario behavior. guard does not also verify specs in
+parallel: grouping already merges selectors across specs, so each package is
+built and run once per guard.
 
 **D8. Say why a test verdict is not a pass.** For every scenario that is
 `fail` or `uncertain`, guard prints the scenario name, the selector, cargo's
@@ -291,7 +315,7 @@ additionally distinguishes "cargo reported a compile error" (the output has an
 `error[E…]` / `could not compile` line) from "the runner exited without cargo
 output" (anything else), because the second is usually an environment
 problem worth one retry and the first never is. agent-spec does not retry on
-its own.
+its own and offers no retry flag; the distinction lets the caller decide.
 
 ## Compatibility
 
@@ -299,14 +323,22 @@ its own.
   (0 active + 1 staged: Error → Info). D2 changes an outcome that was wrong
   (ignored → `pass` becomes `skip`); specs that were green only because of
   ignored tests will turn red under guard — intended, and called out in the
-  release notes. D3 and D4 are additive.
+  release notes. D3 and D4 are additive, except that D4's `lint` warnings can
+  appear on existing specs that carry an unrecognised `Mode:` / `Review:` value
+  or `Level: soak`.
 - D5 changes `requirements plan` batches, `work-units` `depends_on` and
   `requirements graph` cycle diagnostics for any workspace whose
   `## Dependencies` name superseded blocks — intended, since the previous
   output was wrong. Plan JSON edges gain an optional `declared_as` field;
   graph JSON nodes gain an optional `supersedes` field. Workspaces without
   superseded dependencies see identical output (agent-spec's own
-  `requirements plan` output is byte-identical).
+  `requirements plan` output is byte-identical). A workspace whose
+  dependencies name a superseded block with no successor, or a looping
+  `supersedes:` chain, now fails the graph and knowledge gates.
+- D6 relaxes boundary enforcement: a commit that touches no active contract's
+  territory is no longer boundary-checked, and `Forbidden` applies only to
+  commits that touch the forbidding contract's territory.
+  `guard --strict-boundaries` restores the previous check.
 - File formats: the selector gains one optional field; scenarios gain one
   `Mode` value. Older agent-spec versions do not reject it: the parser maps any
   mode other than `optimize` to `Standard` (`src/spec_parser/parser.rs`), so an
@@ -333,7 +365,11 @@ its own.
 - D4: none.
 - D5: none required. Updating `## Dependencies` to the current ids remains
   good hygiene (and clears `references-superseded`), but the plan no longer
-  depends on it.
+  depends on it. The first implementation (`e38c34f`) reports
+  `dependency-supersession-unresolved` as a Warning and treats a split as
+  unresolved; both change to the rule above.
+- D6: downstream workspaces that run `guard --change-scope none` (amberlog's
+  pre-commit hook and CI) can drop the flag and regain boundary enforcement.
 - D7/D8: none required. amberlog can move guard back into its pre-commit hook
   once a full run fits in a few minutes (it currently runs guard only in CI and
   `agent-spec lint` plus `tools/contract-test-names.sh` locally).
@@ -344,7 +380,10 @@ D2 closes a verification-integrity hole: a contributor could make any scenario
 pass by adding `#[ignore]` to its test. D3 lets a spec author choose features
 for test builds only; it grants no capability that editing `Cargo.toml` does not
 already grant. D4 adds a deferral that strict acceptance paths refuse to treat
-as a pass.
+as a pass. D6 stops checking commits that touch no contract's territory, so a
+change that would be out of bounds inside an implementation commit passes when
+committed on its own; the split stays visible in history, and
+`--strict-boundaries` closes it for workspaces that need that guarantee.
 
 ## Privacy Considerations
 
@@ -378,14 +417,18 @@ same requirement ids and paths as today.
   into later tests can change their outcome even with `--test-threads=1`.
   Mitigation: `--no-batch`, and the per-test result lines make the culprit
   visible.
+- D6 lets an out-of-bounds change land by committing it separately from the
+  implementation it belongs to. Mitigation: `--strict-boundaries`; contract
+  review reads the commit range, not single commits.
 
 ## Consequences
 
 Good, because a green `lint-knowledge --gate` and a green `guard` can hold at
 the same time throughout a spec-ahead-of-implementation workflow, and because
 no scenario can pass without its test having executed.
-Bad, because the diagnostic vocabulary grows by three codes and one summary
-count, and D2 is a behavior change on upgrade.
+Bad, because the diagnostic vocabulary grows by four knowledge codes, three
+spec lint warnings and one summary count, and D2, D5 and D6 change behavior on
+upgrade.
 
 ## Alternatives Considered
 
@@ -407,43 +450,39 @@ count, and D2 is a behavior change on upgrade.
 - cargo's `required-features` for targets that need features.
 - agent-spec's own `requirements status` tiers (active / staged / archived).
 
+## Resolved Questions
+
+Settled in human review on 2026-09-30; the Decision section above states
+each outcome.
+
+- D1: staged coverage is the default, with no opt-in flag.
+- D1: `requirement-staged` is Info. Both levels leave `--gate` green;
+  staying one round ahead of implementation is a normal state, and
+  `requirements status` already shows the tier.
+- D2: when a filter matches several tests and only some are ignored, the
+  verdict comes from the executed ones and the ignored count is recorded.
+  A filter whose only matches are ignored is still `skip`.
+- D4: `lint` warns on unrecognised `Mode:` and `Review:` values in the same
+  change; `Review:` has the same silent fallback as `Mode:`.
+- D4: `Mode: soak` is the deferral switch. `Level: soak` stays descriptive, and
+  `lint` warns when it appears without `Mode: soak`.
+- D5: a split (several successors) resolves to every successor; no successor
+  or a looping chain is an Error, not a Warning.
+- D5: a dependency on a replacement that is not `Ready` still drops out of
+  batching. That rule predates this proposal and applies to every dependency,
+  so changing it is left to a follow-up proposal.
+- D6: an unowned path is an Error when the commit touches any contract's
+  territory, and is not reported otherwise.
+- D6: `Forbidden` applies only to commits that touch the forbidding contract's
+  territory. Distinguishing commits by who makes them would need an actor
+  field, which ADR-001 rules out.
+- D7: batching is the default immediately; guard does not verify specs in
+  parallel.
+- D8: agent-spec offers no retry flag; retries stay with the caller.
+
 ## Unresolved Questions
 
-- D1: should staged coverage be the default or opt-in (for example
-  `--staged-counts-as-scheduled`)? Default-on matches the README's description
-  of `specs/roadmap/`; opt-in avoids changing any existing workspace's output.
-- D1: Info or Warning for `requirement-staged`?
-- D2: when a filter matches several tests and only some are ignored, is
-  "verdict from the executed ones" enough, or should mixed results be
-  `uncertain`?
-- D4: older versions silently treat `Mode: soak` as `Standard` (see
-  Compatibility). Is a warning for unknown mode values worth adding in the same
-  change, so the next such extension is not silent?
-- D5: should an unresolved superseded dependency be an Error instead of a
-  Warning? It degrades to today's behavior (the edge drops out of batching), so
-  the batch list can still be wrong.
-- D5: when the current replacement is not `Ready` (for example it is blocked
-  on open questions), the edge still drops out of batching, as any dependency
-  on a non-ready block does today. Should that pre-existing rule change too, or
-  stay out of this proposal?
-- D6: should a path matched by no contract's allow-list be an Error only
-  when the commit also touches some contract's territory (mixed commit), and
-  pass silently otherwise? The proposal reports it as a Warning in all cases.
-- D6: should a contract's `Forbidden` list apply to commits that do not touch
-  its territory at all? amberlog's `Forbidden: knowledge/**` means "an
-  implementation session must not edit the truth layer", which is a property
-  of who commits, not of the path; keeping `Forbidden` global still blocks
-  governance commits (supersede) in the product repo.
-
-- D4 vs. existing selector field: `Level: soak` / `层级: soak` already
-  exists on the selector (amberlog uses it) but guard ignores it. Should D4
-  key off that value instead of adding `Mode: soak`, so a scenario states
-  "long-running" once?
-- D7: should batching be the default immediately, or opt-in for one release?
-  Should guard also verify independent specs in parallel?
-- D8: should agent-spec offer `--retry-uncertain <N>` for the "runner exited
-  without cargo output" case, or leave retries to the caller? amberlog chose
-  not to retry in CI, where that case does not arise.
+None.
 
 ## Produces
 

@@ -3,6 +3,7 @@ mod atlas_symbols;
 mod boundaries;
 mod complexity;
 mod structural;
+mod test_batch;
 mod test_verifier;
 
 use std::collections::HashSet;
@@ -19,6 +20,7 @@ pub use boundaries::{
 };
 pub use complexity::ComplexityVerifier;
 pub use structural::StructuralVerifier;
+pub use test_batch::BatchOutcomes;
 pub use test_verifier::{TestRunOptions, TestVerifier};
 
 /// AI verifier mode.

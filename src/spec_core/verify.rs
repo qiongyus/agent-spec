@@ -107,6 +107,10 @@ pub struct TestOutputDetail {
     /// Why no test ran: `compile-error` or `runner-exited`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_class: Option<String>,
+    /// `duration_ms` is the batched group's wall time spread evenly, not a
+    /// time libtest reported for this scenario's tests.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub duration_estimated: bool,
 }
 
 /// Evidence supporting a verification verdict.

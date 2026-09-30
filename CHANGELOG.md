@@ -56,6 +56,8 @@ All notable changes to `agent-spec` are documented here. Format follows
   `unknown-review-mode` (an unrecognized value, which still falls back to
   `Standard` / `Auto`). Pin an agent-spec version that knows `Mode: soak`:
   older versions run such a scenario as a standard one.
+- `--no-batch` and `--test-threads <N>` on `verify`, `lifecycle` and `guard`
+  (REQ-BATCHED-TEST-EXECUTION; see Changed).
 
 ### Changed
 
@@ -69,6 +71,20 @@ All notable changes to `agent-spec` are documented here. Format follows
   `uncertain`. **Upgrade note:** a spec that was green only because its test
   is `#[ignore]`d turns red; give it a real test or, for a long-running
   scenario, `Mode: soak`.
+- Batched test execution (LEP-007 → ADR-006 → REQ-BATCHED-TEST-EXECUTION):
+  bound tests run as one `cargo test --no-fail-fast -- <filters…>` per
+  (package, features, soak) group instead of one `cargo test -q` per
+  scenario, and each scenario's verdict is read back from libtest's per-test
+  `test <path> ... ok|FAILED|ignored` lines (a test belongs to a scenario when
+  its path contains the filter), with the same rules as a single run. guard
+  plans the groups across all active contracts, so a full guard costs about
+  one cargo invocation per package. Batched runs pass `--test-threads=1`
+  unless `--test-threads <N>` says otherwise. A group that fails before any
+  test runs marks its scenarios `uncertain`; a group whose output has no
+  recognizable per-test lines (for example `harness = false`) falls back to
+  per-scenario runs. `duration_ms` is the sum of reported per-test times, or
+  the group's wall time spread evenly and flagged `duration_estimated`.
+  `--no-batch` restores the per-scenario invocation.
 - Guard holds each contract to its own boundaries (LEP-007 → ADR-006 →
   REQ-GUARD-CONTRACT-BOUNDARIES): a contract's `Forbidden` and `Allowed
   changes` apply only to a commit that touches its territory (a change matches

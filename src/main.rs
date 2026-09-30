@@ -93,6 +93,13 @@ enum Commands {
         /// Run `Mode: soak` scenarios instead of reporting them deferred
         #[arg(long)]
         include_soak: bool,
+        /// Run each scenario's test in its own `cargo test -q` instead of one
+        /// batched run per (package, features) group
+        #[arg(long)]
+        no_batch: bool,
+        /// libtest --test-threads for batched runs (default 1)
+        #[arg(long)]
+        test_threads: Option<usize>,
     },
     /// Render the coverage matrix (Rule × Scenario × Test × Verdict × Provenance)
     Matrix {
@@ -237,6 +244,13 @@ enum Commands {
         /// Run `Mode: soak` scenarios instead of reporting them deferred
         #[arg(long)]
         include_soak: bool,
+        /// Run each scenario's test in its own `cargo test -q` instead of one
+        /// batched run per (package, features) group
+        #[arg(long)]
+        no_batch: bool,
+        /// libtest --test-threads for batched runs (default 1)
+        #[arg(long)]
+        test_threads: Option<usize>,
     },
     /// Render an explicit Task Contract for agent execution
     Contract {
@@ -267,6 +281,13 @@ enum Commands {
         /// even contracts whose territory the change does not touch
         #[arg(long)]
         strict_boundaries: bool,
+        /// Run each scenario's test in its own `cargo test -q` instead of one
+        /// batched run per (package, features) group
+        #[arg(long)]
+        no_batch: bool,
+        /// libtest --test-threads for batched runs (default 1)
+        #[arg(long)]
+        test_threads: Option<usize>,
     },
     /// Generate a human-readable contract review summary
     Explain {
@@ -1473,6 +1494,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             format,
             emit_questions,
             include_soak,
+            no_batch,
+            test_threads,
         } => cmd_verify(
             &spec,
             &code,
@@ -1481,7 +1504,11 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             &ai_mode,
             &format,
             emit_questions,
-            crate::spec_verify::TestRunOptions { include_soak },
+            crate::spec_verify::TestRunOptions {
+                include_soak,
+                no_batch,
+                test_threads,
+            },
         ),
         Commands::Matrix {
             spec,
@@ -1536,6 +1563,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             resume,
             review_mode,
             include_soak,
+            no_batch,
+            test_threads,
         } => cmd_lifecycle(
             &spec,
             &code,
@@ -1549,7 +1578,11 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             layers.as_deref(),
             resume,
             &review_mode,
-            crate::spec_verify::TestRunOptions { include_soak },
+            crate::spec_verify::TestRunOptions {
+                include_soak,
+                no_batch,
+                test_threads,
+            },
         ),
         Commands::Contract { spec, format } => cmd_contract(&spec, &format),
         Commands::Guard {
@@ -1559,6 +1592,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             change_scope,
             min_score,
             strict_boundaries,
+            no_batch,
+            test_threads,
         } => cmd_guard(
             &spec_dir,
             &code,
@@ -1566,6 +1601,11 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             &change_scope,
             min_score,
             strict_boundaries,
+            crate::spec_verify::TestRunOptions {
+                include_soak: false,
+                no_batch,
+                test_threads,
+            },
         ),
         Commands::Explain {
             spec,
@@ -2852,6 +2892,7 @@ fn cmd_contract(spec: &Path, format: &str) -> Result<(), Box<dyn std::error::Err
 
 // ── Guard (git pre-commit) ──────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_guard(
     spec_dir: &Path,
     code: &Path,
@@ -2859,6 +2900,7 @@ fn cmd_guard(
     change_scope: &str,
     min_score: f64,
     strict_boundaries: bool,
+    test_options: crate::spec_verify::TestRunOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !spec_dir.exists() {
         // No specs directory → nothing to guard, pass silently
@@ -2927,13 +2969,24 @@ fn cmd_guard(
         strict_boundaries,
     );
 
+    // D7: run every contract's bound tests as one batch per group, once.
+    let resolved_specs = contracts
+        .iter()
+        .map(|(_, gw)| gw.resolved())
+        .collect::<Vec<_>>();
+    let prefetch =
+        crate::spec_verify::TestVerifier::prefetch(&resolved_specs, &code_paths, &test_options)?;
+
     for ((spec_file, gw), plan) in contracts.into_iter().zip(plans) {
         let contract_changes = if plan.touched {
             effective_changes.clone()
         } else {
             Vec::new()
         };
-        let gw = gw.with_boundary_exemptions(plan.exempt);
+        let gw = gw
+            .with_boundary_exemptions(plan.exempt)
+            .with_test_options(test_options)
+            .with_test_prefetch(prefetch.clone());
 
         // Lint check
         if let Err(failure) = gw.quality_gate(min_score) {

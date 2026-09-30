@@ -20,6 +20,7 @@ pub struct SpecGateway {
     doc: crate::spec_core::SpecDocument,
     resolved: crate::spec_core::ResolvedSpec,
     test_options: TestRunOptions,
+    test_prefetch: Option<Arc<crate::spec_verify::BatchOutcomes>>,
     boundary_exempt: Vec<String>,
 }
 
@@ -28,6 +29,17 @@ impl SpecGateway {
     /// scenarios are included).
     pub fn with_test_options(mut self, options: TestRunOptions) -> Self {
         self.test_options = options;
+        self
+    }
+
+    /// Batched test runs already executed for several specs (guard runs
+    /// every spec's groups once); this spec's scenarios read their verdicts
+    /// from them instead of running cargo again.
+    pub fn with_test_prefetch(
+        mut self,
+        prefetch: Option<Arc<crate::spec_verify::BatchOutcomes>>,
+    ) -> Self {
+        self.test_prefetch = prefetch;
         self
     }
 
@@ -47,6 +59,7 @@ impl SpecGateway {
             doc,
             resolved,
             test_options: TestRunOptions::default(),
+            test_prefetch: None,
             boundary_exempt: Vec::new(),
         })
     }
@@ -59,6 +72,7 @@ impl SpecGateway {
             doc,
             resolved,
             test_options: TestRunOptions::default(),
+            test_prefetch: None,
             boundary_exempt: Vec::new(),
         })
     }
@@ -239,7 +253,9 @@ impl SpecGateway {
         let structural = StructuralVerifier;
         let boundaries = BoundariesVerifier::with_exempt(self.boundary_exempt.clone());
         let atlas_symbols = AtlasSymbolVerifier;
-        let test = TestVerifier::default().with_options(self.test_options);
+        let test = TestVerifier::default()
+            .with_options(self.test_options)
+            .with_prefetched(self.test_prefetch.clone());
         let complexity = ComplexityVerifier;
         let verifiers: Vec<&dyn Verifier> = vec![
             &structural,

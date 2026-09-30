@@ -10,6 +10,9 @@ use crate::spec_core::{
     StepVerdict, TestOutputDetail, TestSelector, Verdict,
 };
 
+use super::test_batch::{
+    BatchOutcomes, GroupKey, GroupOutcome, TestBatchPlan, attribute, execute_plan,
+};
 use super::{VerificationContext, Verifier};
 
 /// Runs each bound scenario's `cargo test` and judges the verdict from what
@@ -18,6 +21,9 @@ use super::{VerificationContext, Verifier};
 pub struct TestVerifier {
     runner: Arc<dyn TestCommandRunner>,
     options: TestRunOptions,
+    /// Group runs already executed for several specs at once (guard); when
+    /// absent, this spec's own groups are run.
+    prefetched: Option<Arc<BatchOutcomes>>,
 }
 
 /// How bound tests are run.
@@ -26,6 +32,12 @@ pub struct TestRunOptions {
     /// Run `Mode: soak` scenarios (with `--include-ignored`) instead of
     /// reporting them `deferred`.
     pub include_soak: bool,
+    /// One `cargo test -q` per scenario instead of one batched run per
+    /// (package, features, soak) group.
+    pub no_batch: bool,
+    /// libtest `--test-threads` for batched runs (default 1, so tests
+    /// validated one at a time are not suddenly run concurrently).
+    pub test_threads: Option<usize>,
 }
 
 impl Default for TestVerifier {
@@ -39,7 +51,47 @@ impl TestVerifier {
         Self {
             runner,
             options: TestRunOptions::default(),
+            prefetched: None,
         }
+    }
+
+    pub fn with_prefetched(mut self, outcomes: Option<Arc<BatchOutcomes>>) -> Self {
+        self.prefetched = outcomes;
+        self
+    }
+
+    /// Run the batch plan for several specs' scenarios at once, so guard
+    /// builds and runs each group once rather than once per spec.
+    pub fn prefetch(
+        specs: &[&crate::spec_core::ResolvedSpec],
+        code_paths: &[PathBuf],
+        options: &TestRunOptions,
+    ) -> SpecResult<Option<Arc<BatchOutcomes>>> {
+        if options.no_batch {
+            return Ok(None);
+        }
+        let Some(workspace_root) = find_workspace_root(code_paths) else {
+            return Ok(None);
+        };
+        let legacy_bindings = collect_legacy_comment_bindings(code_paths)?;
+        let bindings = specs
+            .iter()
+            .flat_map(|spec| &spec.all_scenarios)
+            .filter_map(|scenario| {
+                resolve_test_binding(scenario, &legacy_bindings)
+                    .map(|binding| (binding.selector, scenario.mode == ScenarioMode::Soak))
+            })
+            .collect::<Vec<_>>();
+        let plan = TestBatchPlan::build(
+            bindings.iter().map(|(selector, soak)| (selector, *soak)),
+            options,
+        );
+        Ok(Some(Arc::new(execute_plan(
+            &plan,
+            &CargoRunner,
+            &workspace_root,
+            options,
+        )?)))
     }
 
     pub fn with_options(mut self, options: TestRunOptions) -> Self {
@@ -106,7 +158,7 @@ fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BindingSource {
+pub(crate) enum BindingSource {
     ExplicitScenarioSelector,
     LegacyComment,
 }
@@ -128,55 +180,148 @@ impl Verifier for TestVerifier {
         };
 
         let legacy_bindings = collect_legacy_comment_bindings(&ctx.code_paths)?;
-        let mut results = Vec::new();
+        let bound = ctx
+            .resolved_spec
+            .all_scenarios
+            .iter()
+            .filter_map(|scenario| {
+                resolve_test_binding(scenario, &legacy_bindings).map(|binding| (scenario, binding))
+            })
+            .collect::<Vec<_>>();
 
-        for scenario in &ctx.resolved_spec.all_scenarios {
-            let Some(binding) = resolve_test_binding(scenario, &legacy_bindings) else {
-                continue;
-            };
+        let outcomes = if self.options.no_batch {
+            None
+        } else if let Some(prefetched) = &self.prefetched {
+            Some(Arc::clone(prefetched))
+        } else {
+            let plan = TestBatchPlan::build(
+                bound.iter().map(|(scenario, binding)| {
+                    (&binding.selector, scenario.mode == ScenarioMode::Soak)
+                }),
+                &self.options,
+            );
+            Some(Arc::new(execute_plan(
+                &plan,
+                self.runner.as_ref(),
+                &workspace_root,
+                &self.options,
+            )?))
+        };
+
+        let mut results = Vec::new();
+        for (scenario, binding) in &bound {
             let soak = scenario.mode == ScenarioMode::Soak;
             if soak && !self.options.include_soak {
                 results.push(deferred_result(scenario));
                 continue;
             }
-
-            let mut args = build_cargo_test_args(&binding.selector);
-            if soak {
-                // A soak test may stay #[ignore]d for plain `cargo test`.
-                args.extend(["--".to_string(), "--include-ignored".to_string()]);
-            }
-            let started = Instant::now();
-            let run = self.runner.run(&args, &workspace_root)?;
-            let duration_ms = started.elapsed().as_millis() as u64;
-
-            let combined = combine_output(&run.stdout, &run.stderr);
-            let judgment = judge_test_run(&run.exit, &combined, scenario.review);
-            let reason = judgment_reason(&judgment, &binding.selector.label(), binding.source);
-            results.push(ScenarioResult {
-                scenario_name: scenario.name.clone(),
-                verdict: judgment.verdict,
-                step_results: scenario
-                    .steps
-                    .iter()
-                    .map(|step| StepVerdict {
-                        step_text: step.text.clone(),
-                        verdict: judgment.verdict,
-                        reason: reason.clone(),
-                    })
-                    .collect(),
-                evidence: vec![test_output_evidence(
-                    &binding.selector,
-                    combined,
-                    &run.exit,
-                    &judgment,
-                )],
-                duration_ms,
-                provenance: None,
+            let group = outcomes.as_ref().and_then(|outcomes| {
+                outcomes
+                    .groups
+                    .get(&GroupKey::for_selector(&binding.selector, soak))
             });
+            let result = match group {
+                Some(group) if !group.needs_fallback() => batched_result(scenario, binding, group),
+                // --no-batch, an unparseable group, or a group a prefetch
+                // did not cover: run this scenario on its own.
+                _ => self.run_one(scenario, binding, &workspace_root)?,
+            };
+            results.push(result);
         }
 
         Ok(results)
     }
+}
+
+impl TestVerifier {
+    /// One `cargo test -q` for one scenario (the pre-batching invocation).
+    fn run_one(
+        &self,
+        scenario: &Scenario,
+        binding: &TestBinding,
+        workspace_root: &Path,
+    ) -> SpecResult<ScenarioResult> {
+        let mut args = build_cargo_test_args(&binding.selector);
+        if scenario.mode == ScenarioMode::Soak {
+            // A soak test may stay #[ignore]d for plain `cargo test`.
+            args.extend(["--".to_string(), "--include-ignored".to_string()]);
+        }
+        let started = Instant::now();
+        let run = self.runner.run(&args, workspace_root)?;
+        let duration_ms = started.elapsed().as_millis() as u64;
+
+        let combined = combine_output(&run.stdout, &run.stderr);
+        let judgment = judge_test_run(&run.exit, &combined, scenario.review);
+        let evidence = test_output_evidence(&binding.selector, combined, &run.exit, &judgment);
+        Ok(scenario_result(
+            scenario,
+            binding,
+            &judgment,
+            evidence,
+            duration_ms,
+        ))
+    }
+}
+
+fn scenario_result(
+    scenario: &Scenario,
+    binding: &TestBinding,
+    judgment: &TestJudgment,
+    evidence: Evidence,
+    duration_ms: u64,
+) -> ScenarioResult {
+    let reason = judgment_reason(judgment, &binding.selector.label(), binding.source);
+    ScenarioResult {
+        scenario_name: scenario.name.clone(),
+        verdict: judgment.verdict,
+        step_results: scenario
+            .steps
+            .iter()
+            .map(|step| StepVerdict {
+                step_text: step.text.clone(),
+                verdict: judgment.verdict,
+                reason: reason.clone(),
+            })
+            .collect(),
+        evidence: vec![evidence],
+        duration_ms,
+        provenance: None,
+    }
+}
+
+/// A scenario's result read from its group's batched run.
+fn batched_result(
+    scenario: &Scenario,
+    binding: &TestBinding,
+    group: &GroupOutcome,
+) -> ScenarioResult {
+    let batched = attribute(&binding.selector.filter, scenario.review, group);
+    // The group's exit status describes the whole group; it belongs in the
+    // evidence of a scenario that did not pass, not of one that did.
+    let exit = if matches!(
+        batched.judgment.verdict,
+        Verdict::Pass | Verdict::PendingReview
+    ) {
+        TestExit {
+            success: true,
+            code: None,
+            signal: None,
+        }
+    } else {
+        group.run.exit
+    };
+    let mut evidence =
+        test_output_evidence(&binding.selector, batched.output, &exit, &batched.judgment);
+    if let Evidence::TestOutput { detail, .. } = &mut evidence {
+        detail.duration_estimated = batched.duration_estimated;
+    }
+    scenario_result(
+        scenario,
+        binding,
+        &batched.judgment,
+        evidence,
+        batched.duration_ms,
+    )
 }
 
 /// A soak scenario the run does not execute: reported, never run.
@@ -200,7 +345,7 @@ fn deferred_result(scenario: &Scenario) -> ScenarioResult {
     }
 }
 
-fn combine_output(stdout: &str, stderr: &str) -> String {
+pub(crate) fn combine_output(stdout: &str, stderr: &str) -> String {
     if stderr.trim().is_empty() {
         stdout.to_string()
     } else if stdout.trim().is_empty() {
@@ -290,7 +435,7 @@ fn build_cargo_test_args(selector: &TestSelector) -> Vec<String> {
 
 /// The selector's `Features:` value, or `None` when absent or blank (a blank
 /// value is a lint warning, never an empty `--features` argument).
-fn selector_features(selector: &TestSelector) -> Option<&str> {
+pub(crate) fn selector_features(selector: &TestSelector) -> Option<&str> {
     selector
         .features
         .as_deref()
@@ -307,7 +452,7 @@ fn test_output_evidence(
     Evidence::TestOutput {
         test_name: selector.label(),
         stdout,
-        passed: exit.success && judgment.executed() > 0,
+        passed: matches!(judgment.verdict, Verdict::Pass | Verdict::PendingReview),
         package: selector.package.clone(),
         level: selector.level.clone(),
         test_double: selector.test_double.clone(),
@@ -321,6 +466,7 @@ fn test_output_evidence(
                 .map(|summary| summary.ignored)
                 .filter(|ignored| *ignored > 0),
             failure_class: judgment.failure_class.map(str::to_string),
+            duration_estimated: false,
         },
     }
 }
@@ -328,15 +474,15 @@ fn test_output_evidence(
 /// Totals of every libtest `test result:` line in a cargo run (one line per
 /// test binary).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct LibtestSummary {
-    passed: usize,
-    failed: usize,
-    ignored: usize,
+pub(crate) struct LibtestSummary {
+    pub(crate) passed: usize,
+    pub(crate) failed: usize,
+    pub(crate) ignored: usize,
 }
 
 impl LibtestSummary {
     /// Tests that actually ran. An ignored test is matched but never run.
-    fn executed(&self) -> usize {
+    pub(crate) fn executed(&self) -> usize {
         self.passed + self.failed
     }
 }
@@ -344,7 +490,7 @@ impl LibtestSummary {
 /// Sum the `test result:` summary lines; `None` when there is none. libtest
 /// prints `running 1 test` for a filter that matches only an `#[ignore]`d
 /// test, so the `running` lines cannot tell executed from ignored.
-fn parse_libtest_summary(output: &str) -> Option<LibtestSummary> {
+pub(crate) fn parse_libtest_summary(output: &str) -> Option<LibtestSummary> {
     let mut total: Option<LibtestSummary> = None;
     for line in output.lines() {
         let Some(rest) = line.trim().strip_prefix("test result:") else {
@@ -371,7 +517,7 @@ fn parse_libtest_summary(output: &str) -> Option<LibtestSummary> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum JudgmentKind {
+pub(crate) enum JudgmentKind {
     /// Matched tests ran and all passed.
     Covered,
     /// At least one matched test ran and failed.
@@ -387,24 +533,18 @@ enum JudgmentKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TestJudgment {
-    verdict: Verdict,
-    kind: JudgmentKind,
-    summary: Option<LibtestSummary>,
+pub(crate) struct TestJudgment {
+    pub(crate) verdict: Verdict,
+    pub(crate) kind: JudgmentKind,
+    pub(crate) summary: Option<LibtestSummary>,
     /// `compile-error` or `runner-exited` for a run that never reached a test.
-    failure_class: Option<&'static str>,
-}
-
-impl TestJudgment {
-    fn executed(&self) -> usize {
-        self.summary.map_or(0, |summary| summary.executed())
-    }
+    pub(crate) failure_class: Option<&'static str>,
 }
 
 /// Judge a cargo test run from its exit and libtest's summary. A scenario
 /// passes only when at least one matched test executed; a missing or
 /// malformed summary is `uncertain`, never `pass`.
-fn judge_test_run(exit: &TestExit, output: &str, review: ReviewMode) -> TestJudgment {
+pub(crate) fn judge_test_run(exit: &TestExit, output: &str, review: ReviewMode) -> TestJudgment {
     let summary = parse_libtest_summary(output);
     let executed = summary.map_or(0, |summary| summary.executed());
     let ignored = summary.map_or(0, |summary| summary.ignored);
@@ -454,7 +594,11 @@ fn not_run_class(output: &str) -> &'static str {
     }
 }
 
-fn judgment_reason(judgment: &TestJudgment, selector_label: &str, source: BindingSource) -> String {
+pub(crate) fn judgment_reason(
+    judgment: &TestJudgment,
+    selector_label: &str,
+    source: BindingSource,
+) -> String {
     let binding = match source {
         BindingSource::ExplicitScenarioSelector => "explicit test",
         BindingSource::LegacyComment => "legacy @spec test",
@@ -658,6 +802,29 @@ mod tests {
         format!(
             "test result: {status}. {passed} passed; {failed} failed; {ignored} ignored; 0 measured; 3 filtered out; finished in 0.00s"
         )
+    }
+
+    #[test]
+    fn test_cargo_test_executed_count_distinguishes_zero_match_from_mixed_targets() {
+        // A filter that matches nothing in any binary executes zero tests,
+        // and so does not pass.
+        let zero = "running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out\n";
+        assert_eq!(parse_libtest_summary(zero).unwrap().executed(), 0);
+        assert_eq!(
+            judge_test_run(&exit(0), zero, ReviewMode::Auto).verdict,
+            Verdict::Skip
+        );
+        // Mixed targets: one binary ran the test, another matched nothing.
+        let mixed = format!(
+            "running 1 test\n.\n{}\n\nrunning 0 tests\n{}\n",
+            summary_line(1, 0, 0),
+            summary_line(0, 0, 0)
+        );
+        assert_eq!(parse_libtest_summary(&mixed).unwrap().executed(), 1);
+        assert_eq!(
+            judge_test_run(&exit(0), &mixed, ReviewMode::Auto).verdict,
+            Verdict::Pass
+        );
     }
 
     #[test]
@@ -873,7 +1040,11 @@ mod tests {
 
     #[test]
     fn test_include_soak_runs_with_include_ignored() {
-        let (calls, results) = verify_soak(TestRunOptions { include_soak: true });
+        let (calls, results) = verify_soak(TestRunOptions {
+            include_soak: true,
+            no_batch: true,
+            ..TestRunOptions::default()
+        });
         assert_eq!(calls.len(), 1);
         assert!(
             calls[0].ends_with(&strings(&["soak_case", "--", "--include-ignored"])),
@@ -881,6 +1052,86 @@ mod tests {
             calls[0]
         );
         assert_eq!(results[0].verdict, Verdict::Fail);
+    }
+
+    struct ScriptRunner {
+        calls: std::sync::Mutex<Vec<Vec<String>>>,
+        exit_code: i32,
+        stdout: String,
+    }
+
+    impl TestCommandRunner for ScriptRunner {
+        fn run(
+            &self,
+            args: &[String],
+            _cwd: &std::path::Path,
+        ) -> crate::spec_core::SpecResult<TestRun> {
+            self.calls.lock().unwrap().push(args.to_vec());
+            Ok(TestRun {
+                exit: exit(self.exit_code),
+                stdout: self.stdout.clone(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    const TWO_SCENARIO_SPEC: &str = "spec: task\nname: \"Two\"\n---\n\n## Completion Criteria\n\nScenario: first case\n  Test:\n    Package: probe\n    Filter: alpha\n  Given a\n  When b\n  Then c\n\nScenario: second case\n  Test:\n    Package: probe\n    Filter: beta\n  Given a\n  When b\n  Then c\n";
+
+    fn verify_two(stdout: &str, options: TestRunOptions) -> Vec<Vec<String>> {
+        let runner = std::sync::Arc::new(ScriptRunner {
+            calls: Default::default(),
+            exit_code: 0,
+            stdout: stdout.to_string(),
+        });
+        let dir = std::env::temp_dir().join(format!(
+            "agent-spec-batch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"probe\"\n").unwrap();
+        let doc = crate::spec_parser::parse_spec_from_str(TWO_SCENARIO_SPEC).unwrap();
+        let ctx = crate::spec_verify::VerificationContext {
+            code_paths: vec![dir.clone()],
+            change_paths: Vec::new(),
+            ai_mode: crate::spec_verify::AiMode::Off,
+            resolved_spec: crate::spec_parser::resolve_spec(doc, &[]).unwrap(),
+        };
+        TestVerifier::with_runner(runner.clone())
+            .with_options(options)
+            .verify(&ctx)
+            .unwrap();
+        std::fs::remove_dir_all(dir).ok();
+        runner.calls.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn test_batch_unparseable_output_falls_back_to_per_scenario_runs() {
+        // A custom harness: success, no per-test lines, no libtest summary.
+        let calls = verify_two("custom harness: all good\n", TestRunOptions::default());
+        assert_eq!(calls.len(), 3, "{calls:?}");
+        assert!(!calls[0].iter().any(|arg| arg == "-q"), "{:?}", calls[0]);
+        for call in &calls[1..] {
+            assert!(call.iter().any(|arg| arg == "-q"), "{call:?}");
+        }
+    }
+
+    #[test]
+    fn test_no_batch_runs_each_scenario_separately() {
+        let calls = verify_two(
+            &format!("running 1 test\n.\n{}\n", summary_line(1, 0, 0)),
+            TestRunOptions {
+                no_batch: true,
+                ..TestRunOptions::default()
+            },
+        );
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        for call in &calls {
+            assert!(call.iter().any(|arg| arg == "-q"), "{call:?}");
+        }
     }
 
     #[test]

@@ -15,7 +15,8 @@ A downstream workspace (amberlog, 2026-09-28) accepted 17 requirement blocks in
 one governance step and then drafted one task contract per block — 313
 scenarios in total. Wiring those contracts into CI surfaced four gaps, and
 ordering the first round's work from `requirements plan` surfaced a fifth. Moving the first fully green contract into `specs/`
-(2026-09-29) surfaced a sixth. Each was
+(2026-09-29) surfaced a sixth. Running guard as a pre-commit hook once all 17
+contracts were active (2026-09-30) surfaced a seventh and an eighth. Each was
 reproduced against agent-spec 1.4.0 (`main` at `2483398`; the
 `feat/clause-grouping` fork at `5ae1dc1` behaves identically in every code path
 cited below).
@@ -119,6 +120,34 @@ failure more frequent, not less. The downstream workaround is
 `agent-spec guard --change-scope none` in both pre-commit and CI, which keeps
 lint and test verification but drops boundary enforcement entirely.
 
+**Gap 7 — guard runs one `cargo test` per scenario, sequentially.**
+`TestVerifier::verify` spawns `cargo test -q [-p <package>] <filter>` once for
+every bound scenario, and `cmd_guard` verifies the specs one after another. In
+amberlog (17 contracts, 318 scenarios, 305 of them bound to one package) a
+full guard takes about 26 minutes: 51 tests that each take longer than 20 s
+(system tests waiting on flush intervals, plus one shortened soak) account for
+about 15 minutes, and the remaining ~285 invocations about 11 minutes, of
+which roughly a second each is per-invocation overhead (cargo's up-to-date
+check, and in amberlog a remote build wrapper's sync and ssh round trip), not
+test time. The tests themselves
+would run in a few minutes as one `cargo test -p <package>`: libtest runs a
+binary's tests in parallel and accepts several filters at once. At this cost
+guard cannot stay in a pre-commit hook; the downstream workspace moved it to
+CI and runs `agent-spec lint` plus a selector-existence script locally, so a
+contract whose tests are red is now only caught after push. Narrowing guard to
+the changed contracts does not help when most scenarios share one package.
+
+**Gap 8 — an `uncertain` verdict carries no reason.**
+`test_run_verdict` returns `uncertain` whenever cargo exits non-zero before any
+`running N tests` line appears, and there is no timeout. That lumps together a
+compile error, a toolchain failure and a test runner that never started: in
+amberlog (2026-09-30) a remote build wrapper failed to start under load (exit
+code 255, no cargo output), one scenario came back `uncertain`, and the commit
+was blocked; re-running the scenario alone passed. `guard` prints only the
+per-spec summary (`… 1 uncertain`), so telling a flaky runner from a real
+build failure means re-running by hand. The exit code and the tail of the
+output are captured in `Evidence::TestOutput` but never shown by guard.
+
 ## Motivation
 
 agent-spec's value is that a green gate means "the contract holds". Gap 2 and
@@ -140,6 +169,8 @@ text format and must be re-derived by every adopter.
   replacement, never after nothing.
 - `guard` holds each contract to its own boundaries without failing commits
   that only touch other contracts' territory.
+- A full guard costs about one `cargo test` per package, not one per scenario.
+- A non-passing test verdict says why, without re-running it by hand.
 
 ## Non-Goals
 
@@ -233,6 +264,35 @@ allow-list and not attributable is reported once, as the Warning
 `guard --strict-boundaries` keeps today's behavior for workspaces that want
 every commit to stay inside every contract.
 
+**D7. Batch test selectors per package.** Before verifying, guard (and
+`lifecycle` / `verify` over several scenarios) groups the bound selectors by
+`(package, features)` and runs one `cargo test [-p <package>]
+[--features …] --no-fail-fast -- <filter>…` per group, without `-q`, so
+libtest prints one `test <path> ... ok | FAILED | ignored` line per test.
+Each scenario's verdict is then computed from the tests whose path contains
+its filter (cargo's substring semantics), with D2's rules: none matched →
+`skip`; all matched ignored → `skip` with the ignored note; any matched
+failed → `fail`; otherwise `pass` (or `pending_review`). A group whose
+cargo run produced no per-test lines at all (build failure) marks all its
+scenarios `uncertain`, as today. `duration_ms` becomes the sum of the matched
+tests' reported times when libtest reports them, else the group's wall time
+divided evenly and flagged as estimated. Isolation stays the default:
+the batched run passes `--test-threads=1` unless the new flag
+`--test-threads <N>` (or a `[verify] test_threads` setting) says otherwise,
+so tests validated one at a time are not suddenly run concurrently; the
+per-invocation overhead disappears either way. `--no-batch` keeps the
+current one-invocation-per-scenario behavior.
+
+**D8. Say why a test verdict is not a pass.** For every scenario that is
+`fail` or `uncertain`, guard prints the scenario name, the selector, cargo's
+exit status (code or signal) and the last lines of the combined output
+(already in `Evidence::TestOutput`), below the per-spec summary. `uncertain`
+additionally distinguishes "cargo reported a compile error" (the output has an
+`error[E…]` / `could not compile` line) from "the runner exited without cargo
+output" (anything else), because the second is usually an environment
+problem worth one retry and the first never is. agent-spec does not retry on
+its own.
+
 ## Compatibility
 
 - CLI and public API: D1 adds three diagnostic codes and relaxes one outcome
@@ -252,6 +312,10 @@ every commit to stay inside every contract.
   mode other than `optimize` to `Standard` (`src/spec_parser/parser.rs`), so an
   older guard would run a soak scenario as an ordinary one. Workspaces that
   adopt `Mode: soak` must pin an agent-spec version that understands it.
+- D7 changes how tests are invoked, not what a verdict means; `--no-batch`
+  restores the old invocation. Timing-sensitive tests are protected by the
+  `--test-threads=1` default. D8 only adds output lines to non-passing
+  guard runs.
 - Existing specs and KLL artifacts: agent-spec's own `specs/roadmap/` contracts
   that satisfy accepted requirements would move from `requirement-uncovered`
   to `requirement-staged` — the diagnostic set of this repository changes
@@ -270,6 +334,9 @@ every commit to stay inside every contract.
 - D5: none required. Updating `## Dependencies` to the current ids remains
   good hygiene (and clears `references-superseded`), but the plan no longer
   depends on it.
+- D7/D8: none required. amberlog can move guard back into its pre-commit hook
+  once a full run fits in a few minutes (it currently runs guard only in CI and
+  `agent-spec lint` plus `tools/contract-test-names.sh` locally).
 
 ## Security Considerations
 
@@ -294,6 +361,11 @@ same requirement ids and paths as today.
 - `specs/roadmap/` remains the staged tier's only location. Invalidated if: a
   configurable staged directory is introduced; D1 then reads the same setting.
 
+- libtest prints one `test <path> ... <result>` line per test when run
+  without `-q` (D7). Invalidated if: the format changes or a custom test
+  harness (`harness = false`) prints something else; mitigated by falling back
+  to per-scenario invocation for a group whose output cannot be parsed.
+
 ### Risks
 
 - D1 lets a requirement stay "scheduled" indefinitely. Mitigation:
@@ -301,6 +373,11 @@ same requirement ids and paths as today.
   threshold.
 - D2 turns previously green specs red on upgrade. Mitigation: release note plus
   a one-line evidence message naming the ignored test.
+- D7 runs a package's bound tests in one process tree; a test that leaks
+  global state (environment variables, a fixed port, the working directory)
+  into later tests can change their outcome even with `--test-threads=1`.
+  Mitigation: `--no-batch`, and the per-test result lines make the culprit
+  visible.
 
 ## Consequences
 
@@ -357,6 +434,16 @@ count, and D2 is a behavior change on upgrade.
   implementation session must not edit the truth layer", which is a property
   of who commits, not of the path; keeping `Forbidden` global still blocks
   governance commits (supersede) in the product repo.
+
+- D4 vs. existing selector field: `Level: soak` / `层级: soak` already
+  exists on the selector (amberlog uses it) but guard ignores it. Should D4
+  key off that value instead of adding `Mode: soak`, so a scenario states
+  "long-running" once?
+- D7: should batching be the default immediately, or opt-in for one release?
+  Should guard also verify independent specs in parallel?
+- D8: should agent-spec offer `--retry-uncertain <N>` for the "runner exited
+  without cargo output" case, or leave retries to the caller? amberlog chose
+  not to retry in CI, where that case does not arise.
 
 ## Produces
 

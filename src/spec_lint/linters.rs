@@ -513,6 +513,70 @@ impl SpecLinter for EmptySelectorFeaturesLinter {
     }
 }
 
+/// Scenario field values that do not say what the author meant:
+/// `soak-level-without-mode` (a selector says `Level: soak` but the scenario
+/// is not `Mode: soak`, so gates still run it on every commit) and
+/// `unknown-scenario-mode` / `unknown-review-mode` (a value the parser did not
+/// recognize fell back to `Standard` / `Auto`).
+pub struct ScenarioFieldValueLinter;
+
+impl SpecLinter for ScenarioFieldValueLinter {
+    fn name(&self) -> &str {
+        "scenario-field-values"
+    }
+
+    fn lint(&self, doc: &SpecDocument) -> Vec<LintDiagnostic> {
+        let mut diags = Vec::new();
+        for section in &doc.sections {
+            let Section::AcceptanceCriteria { scenarios, .. } = section else {
+                continue;
+            };
+            for scenario in scenarios {
+                let soak_level = scenario
+                    .test_selector
+                    .as_ref()
+                    .and_then(|selector| selector.level.as_deref())
+                    .is_some_and(|level| level.trim().eq_ignore_ascii_case("soak"));
+                if soak_level && scenario.mode != crate::spec_core::ScenarioMode::Soak {
+                    diags.push(LintDiagnostic {
+                        rule: "soak-level-without-mode".into(),
+                        severity: Severity::Warning,
+                        message: format!(
+                            "scenario '{}' has `Level: soak` but no `Mode: soak`; per-commit gates still run it",
+                            scenario.name
+                        ),
+                        span: scenario.span,
+                        suggestion: Some(
+                            "add `Mode: soak` / `模式: soak` so guard defers it and `--include-soak` runs it".into(),
+                        ),
+                    });
+                }
+                for field in &scenario.unrecognized {
+                    let (rule, fallback, known) = match field.field.as_str() {
+                        "Mode" => (
+                            "unknown-scenario-mode",
+                            "Standard",
+                            "standard, optimize, soak",
+                        ),
+                        _ => ("unknown-review-mode", "Auto", "auto, human"),
+                    };
+                    diags.push(LintDiagnostic {
+                        rule: rule.into(),
+                        severity: Severity::Warning,
+                        message: format!(
+                            "scenario '{}' has unrecognized `{}: {}`; it is treated as {fallback}",
+                            scenario.name, field.field, field.value
+                        ),
+                        span: scenario.span,
+                        suggestion: Some(format!("use one of: {known}")),
+                    });
+                }
+            }
+        }
+        diags
+    }
+}
+
 // =============================================================================
 // 8. ScenarioPresenceLinter
 // =============================================================================

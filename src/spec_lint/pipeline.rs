@@ -29,6 +29,7 @@ impl LintPipeline {
         p.add(Box::new(super::linters::ImplicitDepLinter));
         p.add(Box::new(super::linters::ExplicitTestBindingLinter));
         p.add(Box::new(super::linters::EmptySelectorFeaturesLinter));
+        p.add(Box::new(super::linters::ScenarioFieldValueLinter));
         p.add(Box::new(super::linters::ScenarioPresenceLinter));
         p.add(Box::new(super::linters::SycophancyLinter));
         p.add(Box::new(super::linters::DecisionCoverageLinter));

@@ -9,7 +9,8 @@ use crate::spec_lint::LintPipeline;
 use crate::spec_report::OutputFormat;
 use crate::spec_verify::{
     AiBackend, AiMode, AiVerifier, AtlasSymbolVerifier, BoundariesVerifier, ComplexityVerifier,
-    StructuralVerifier, TestVerifier, VerificationContext, Verifier, run_verification,
+    StructuralVerifier, TestRunOptions, TestVerifier, VerificationContext, Verifier,
+    run_verification,
 };
 
 use super::TaskContract;
@@ -18,21 +19,37 @@ use super::TaskContract;
 pub struct SpecGateway {
     doc: crate::spec_core::SpecDocument,
     resolved: crate::spec_core::ResolvedSpec,
+    test_options: TestRunOptions,
 }
 
 impl SpecGateway {
+    /// How the test verifier runs bound tests (for example whether soak
+    /// scenarios are included).
+    pub fn with_test_options(mut self, options: TestRunOptions) -> Self {
+        self.test_options = options;
+        self
+    }
+
     /// Load a spec file from disk.
     pub fn load(spec_path: impl AsRef<Path>) -> SpecResult<Self> {
         let doc = crate::spec_parser::parse_spec(spec_path.as_ref())?;
         let resolved = crate::spec_parser::resolve_spec(doc.clone(), &[])?;
-        Ok(Self { doc, resolved })
+        Ok(Self {
+            doc,
+            resolved,
+            test_options: TestRunOptions::default(),
+        })
     }
 
     /// Load a spec from a string (for tests or inline specs).
     pub fn from_input(input: &str) -> SpecResult<Self> {
         let doc = crate::spec_parser::parse_spec_from_str(input)?;
         let resolved = crate::spec_parser::resolve_spec(doc.clone(), &[])?;
-        Ok(Self { doc, resolved })
+        Ok(Self {
+            doc,
+            resolved,
+            test_options: TestRunOptions::default(),
+        })
     }
 
     /// Access the resolved spec (for caller-mode AI request building).
@@ -211,7 +228,7 @@ impl SpecGateway {
         let structural = StructuralVerifier;
         let boundaries = BoundariesVerifier;
         let atlas_symbols = AtlasSymbolVerifier;
-        let test = TestVerifier::default();
+        let test = TestVerifier::default().with_options(self.test_options);
         let complexity = ComplexityVerifier;
         let verifiers: Vec<&dyn Verifier> = vec![
             &structural,
@@ -245,9 +262,12 @@ impl SpecGateway {
             && report.summary.uncertain == 0;
 
         if review_mode == "strict" {
-            base && report.summary.pending_review == 0
+            // Acceptance paths: an unresolved review or an unrun soak
+            // scenario is not a pass.
+            base && report.summary.pending_review == 0 && report.summary.deferred == 0
         } else {
-            // "auto" mode: PendingReview counts as pass
+            // "auto" mode: PendingReview counts as pass, and a deferred soak
+            // scenario does not block a per-commit gate.
             base
         }
     }
@@ -267,6 +287,7 @@ impl SpecGateway {
                 (r.scenario_name == scenario.name || r.scenario_name == display)
                     && r.verdict != Verdict::Pass
                     && r.verdict != Verdict::PendingReview
+                    && r.verdict != Verdict::Deferred
             });
             if is_non_pass {
                 blocked_gates.push(display.to_owned());
@@ -581,6 +602,7 @@ name: "缺少测试绑定"
                 skipped: 1,
                 uncertain: 0,
                 pending_review: 0,
+                deferred: 0,
             },
         };
 
@@ -822,6 +844,7 @@ name: "Contract fidelity"
                 skipped: 1,
                 uncertain: 0,
                 pending_review: 0,
+                deferred: 0,
             },
         };
 
@@ -887,6 +910,7 @@ name: "lint-not-gating"
                 skipped: 0,
                 uncertain: 0,
                 pending_review: 0,
+                deferred: 0,
             },
         };
         assert!(gw.is_passing(&all_pass));
@@ -1350,6 +1374,59 @@ name: "严格模式"
 
         // Strict mode: PendingReview counts as NOT passing
         assert!(!gw.is_passing_with_review_mode(&report, "strict"));
+    }
+
+    const SOAK_GATEWAY_SAMPLE: &str = r#"spec: task
+name: "soak"
+---
+
+## Completion Criteria
+
+Scenario: first
+  Test: first_case
+  Given a
+  When b
+  Then c
+
+Scenario: second
+  Test: second_case
+  Given a
+  When b
+  Then c
+
+Scenario: long run
+  Mode: soak
+  Test: soak_case
+  Given a
+  When b
+  Then c
+"#;
+
+    fn deferred_report() -> VerificationReport {
+        make_report(
+            "soak",
+            &[
+                ("first", Verdict::Pass),
+                ("second", Verdict::Pass),
+                ("long run", Verdict::Deferred),
+            ],
+        )
+    }
+
+    #[test]
+    fn test_deferred_is_counted_and_passes_in_auto_mode() {
+        let gw = SpecGateway::from_input(SOAK_GATEWAY_SAMPLE).unwrap();
+        let report = deferred_report();
+        assert_eq!(report.summary.deferred, 1);
+        assert_eq!(report.summary.passed, 2);
+        assert!(gw.is_passing_with_review_mode(&report, "auto"));
+        assert!(gw.is_passing(&report));
+    }
+
+    #[test]
+    fn test_deferred_fails_strict_review_mode() {
+        let gw = SpecGateway::from_input(SOAK_GATEWAY_SAMPLE).unwrap();
+        assert!(!gw.is_passing_with_review_mode(&deferred_report(), "strict"));
     }
 
     // ── Optimize Scenario Mode tests ──────────────────────────────

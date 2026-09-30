@@ -90,6 +90,9 @@ enum Commands {
         /// instead of the verification report.
         #[arg(long)]
         emit_questions: bool,
+        /// Run `Mode: soak` scenarios instead of reporting them deferred
+        #[arg(long)]
+        include_soak: bool,
     },
     /// Render the coverage matrix (Rule × Scenario × Test × Verdict × Provenance)
     Matrix {
@@ -231,6 +234,9 @@ enum Commands {
         /// How to treat pending_review verdicts: auto (count as pass) or strict (count as non-passing)
         #[arg(long, default_value = "auto")]
         review_mode: String,
+        /// Run `Mode: soak` scenarios instead of reporting them deferred
+        #[arg(long)]
+        include_soak: bool,
     },
     /// Render an explicit Task Contract for agent execution
     Contract {
@@ -1462,6 +1468,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             ai_mode,
             format,
             emit_questions,
+            include_soak,
         } => cmd_verify(
             &spec,
             &code,
@@ -1470,6 +1477,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             &ai_mode,
             &format,
             emit_questions,
+            crate::spec_verify::TestRunOptions { include_soak },
         ),
         Commands::Matrix {
             spec,
@@ -1523,6 +1531,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             layers,
             resume,
             review_mode,
+            include_soak,
         } => cmd_lifecycle(
             &spec,
             &code,
@@ -1536,6 +1545,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             layers.as_deref(),
             resume,
             &review_mode,
+            crate::spec_verify::TestRunOptions { include_soak },
         ),
         Commands::Contract { spec, format } => cmd_contract(&spec, &format),
         Commands::Guard {
@@ -1718,6 +1728,7 @@ fn cmd_lint(
 
 // ── Verify ──────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_verify(
     spec: &Path,
     code: &Path,
@@ -1726,6 +1737,7 @@ fn cmd_verify(
     ai_mode: &str,
     format: &str,
     emit_questions: bool,
+    test_options: crate::spec_verify::TestRunOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let change_scope = GitChangeScope::parse(change_scope)?;
     let ai_mode = parse_ai_mode(ai_mode)?;
@@ -1762,7 +1774,7 @@ fn cmd_verify(
 
     let structural = crate::spec_verify::StructuralVerifier;
     let boundaries = crate::spec_verify::BoundariesVerifier;
-    let test = crate::spec_verify::TestVerifier::default();
+    let test = crate::spec_verify::TestVerifier::default().with_options(test_options);
     let ai = crate::spec_verify::AiVerifier::from_mode(ai_mode);
     let verifiers: Vec<&dyn crate::spec_verify::Verifier> =
         vec![&structural, &boundaries, &test, &ai];
@@ -2231,6 +2243,7 @@ fn cmd_lifecycle(
     layers: Option<&str>,
     resume: Option<Option<String>>,
     review_mode: &str,
+    test_options: crate::spec_verify::TestRunOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Validate --resume requires --run-log-dir
     let resume_mode = if let Some(ref mode_opt) = resume {
@@ -2252,7 +2265,7 @@ fn cmd_lifecycle(
         None
     };
 
-    let gw = crate::spec_gateway::SpecGateway::load(spec)?;
+    let gw = crate::spec_gateway::SpecGateway::load(spec)?.with_test_options(test_options);
     let change_scope = GitChangeScope::parse(change_scope)?;
     let ai_mode = parse_ai_mode(ai_mode)?;
     let effective_changes = resolve_command_change_paths(spec, code, change, change_scope)?;
@@ -2509,9 +2522,14 @@ fn lifecycle_qa_missing_evidence(
         && report.summary.skipped == 0
         && report.summary.uncertain == 0
         && report.summary.pending_review == 0;
+    // A deferred soak scenario did not run, so it cannot supply targeted-test
+    // evidence; it is exempt here as it is from the per-commit gate.
     let targeted_tests = !scenarios.is_empty()
         && scenarios.iter().all(|scenario| {
             report.results.iter().any(|result| {
+                result.scenario_name == scenario.name
+                    && result.verdict == crate::spec_core::Verdict::Deferred
+            }) || report.results.iter().any(|result| {
                 result.scenario_name == scenario.name
                     && result.verdict == crate::spec_core::Verdict::Pass
                     && result.evidence.iter().any(|evidence| {
@@ -2737,6 +2755,11 @@ fn apply_dependency_skips(
         .iter()
         .filter(|r| r.verdict == crate::spec_core::Verdict::PendingReview)
         .count();
+    let deferred = report
+        .results
+        .iter()
+        .filter(|r| r.verdict == crate::spec_core::Verdict::Deferred)
+        .count();
     report.summary = crate::spec_core::VerificationSummary {
         total,
         passed,
@@ -2744,6 +2767,7 @@ fn apply_dependency_skips(
         skipped,
         uncertain,
         pending_review,
+        deferred,
     };
 }
 
@@ -7231,10 +7255,14 @@ Scenario: cold start follows fallback order
 }
 
 fn format_non_passing_summary(summary: &crate::spec_core::VerificationSummary) -> String {
-    format!(
+    let mut out = format!(
         "verification not passing: {} failed, {} skipped, {} uncertain, {} pending_review",
         summary.failed, summary.skipped, summary.uncertain, summary.pending_review,
-    )
+    );
+    if summary.deferred > 0 {
+        out.push_str(&format!(", {} deferred", summary.deferred));
+    }
+    out
 }
 
 fn generate_template_en(level: &str, name: &str) -> String {
@@ -7462,6 +7490,7 @@ fn verdict_value(verdict: crate::spec_core::Verdict) -> &'static str {
         crate::spec_core::Verdict::Skip => "skip",
         crate::spec_core::Verdict::Uncertain => "uncertain",
         crate::spec_core::Verdict::PendingReview => "pendingreview",
+        crate::spec_core::Verdict::Deferred => "deferred",
     }
 }
 
@@ -7613,6 +7642,15 @@ fn validate_answered_question_binding(
 /// Merge externally-resolved AI decisions into verification results, replacing
 /// the matched scenarios' verdict/steps/evidence and stamping provenance as
 /// `Inferential` (caller-mode bypasses AiVerifier, so it must stamp here).
+/// resolve-ai is an acceptance path: strict review semantics, so neither an
+/// unresolved human review nor an unrun (`deferred`) soak scenario passes.
+fn resolve_ai_is_passing(
+    gw: &crate::spec_gateway::SpecGateway,
+    report: &crate::spec_core::VerificationReport,
+) -> bool {
+    gw.is_passing_with_review_mode(report, "strict")
+}
+
 fn merge_ai_decisions(
     mut results: Vec<crate::spec_core::ScenarioResult>,
     decisions: &[ScenarioAiDecision],
@@ -7762,7 +7800,7 @@ fn cmd_resolve_ai(
     // resolve-ai is an acceptance path: no unresolved human review may be
     // reported as success merely because the general lifecycle default is
     // `review-mode auto`.
-    let passing = gw.is_passing_with_review_mode(&merged_report, "strict");
+    let passing = resolve_ai_is_passing(&gw, &merged_report);
 
     // 5. Output
     if format == "json" {
@@ -10872,6 +10910,36 @@ name: "退款"
     }
 
     #[test]
+    fn test_resolve_ai_keeps_deferred_non_passing() {
+        use crate::spec_core::{ScenarioResult, Verdict};
+        let gw = crate::spec_gateway::SpecGateway::from_input(
+            "spec: task\nname: \"soak\"\n---\n\n## Completion Criteria\n\nScenario: quick\n  Test: quick_case\n  Given a\n  When b\n  Then c\n\nScenario: long run\n  Mode: soak\n  Test: soak_case\n  Given a\n  When b\n  Then c\n",
+        )
+        .unwrap();
+        let result = |name: &str, verdict| ScenarioResult {
+            scenario_name: name.into(),
+            verdict,
+            step_results: vec![],
+            evidence: vec![],
+            duration_ms: 0,
+            provenance: None,
+        };
+        let merged = merge_ai_decisions(
+            vec![
+                result("quick", Verdict::Pass),
+                result("long run", Verdict::Deferred),
+            ],
+            &[],
+        );
+        assert_eq!(merged[1].verdict, Verdict::Deferred);
+        let report = crate::spec_core::VerificationReport::from_results("soak".into(), merged);
+        assert!(
+            !super::resolve_ai_is_passing(&gw, &report),
+            "an unrun soak scenario cannot close an acceptance path"
+        );
+    }
+
+    #[test]
     fn test_merge_ai_decisions_only_replaces_skip() {
         // C7: a caller AI decision must NOT override a mechanically-proven
         // pass/fail — only Skip verdicts may be resolved.
@@ -11677,6 +11745,7 @@ Scenario: verification metadata stays visible
                 skipped: 0,
                 uncertain: 0,
                 pending_review: 0,
+                deferred: 0,
             },
         };
 
@@ -11734,6 +11803,7 @@ Scenario: verification metadata stays visible
                 skipped: 0,
                 uncertain: 0,
                 pending_review: 0,
+                deferred: 0,
             },
         };
 
@@ -11759,6 +11829,7 @@ Scenario: verification metadata stays visible
             skipped: 0,
             uncertain: 0,
             pending_review: 0,
+            deferred: 0,
         };
 
         let trailers = build_stamp_trailers("my-contract", false, &summary, None);
@@ -11835,6 +11906,7 @@ Scenario: verification metadata stays visible
             None,
             None,
             "auto",
+            Default::default(),
         );
         assert!(result.is_ok(), "lifecycle should pass: {result:?}");
 
@@ -12009,6 +12081,7 @@ Scenario: verification metadata stays visible
             mode: crate::spec_core::ScenarioMode::Standard,
             rule: None,
             span: crate::spec_core::Span::default(),
+            unrecognized: Vec::new(),
         }];
 
         let missing =
@@ -12182,6 +12255,7 @@ Scenario: verification metadata stays visible
                 skipped: 0,
                 uncertain: 1,
                 pending_review: 0,
+                deferred: 0,
             },
         };
 
@@ -12248,6 +12322,7 @@ Scenario: verification metadata stays visible
             skipped: 0,
             uncertain: 0,
             pending_review: 0,
+            deferred: 0,
         };
         let jj_ctx = vcs::VcsContext {
             vcs_type: vcs::VcsType::Jj,
@@ -12276,6 +12351,7 @@ Scenario: verification metadata stays visible
             skipped: 0,
             uncertain: 0,
             pending_review: 0,
+            deferred: 0,
         };
         let git_ctx = vcs::VcsContext {
             vcs_type: vcs::VcsType::Git,
@@ -16470,6 +16546,7 @@ Scenario: pass
             None,
             None,
             "auto",
+            Default::default(),
         );
         let after: std::collections::BTreeSet<PathBuf> = fs::read_dir(&dir)
             .unwrap()

@@ -878,6 +878,7 @@ mod tests {
                 depends_on: Vec::new(),
                 rule: None,
                 span: Span::default(),
+                unrecognized: Vec::new(),
             },
             Scenario {
                 name: "scenario B".into(),
@@ -889,6 +890,7 @@ mod tests {
                 depends_on: Vec::new(),
                 rule: None,
                 span: Span::default(),
+                unrecognized: Vec::new(),
             },
             Scenario {
                 name: "scenario C".into(),
@@ -907,6 +909,7 @@ mod tests {
                 depends_on: vec!["scenario A".into()],
                 rule: None,
                 span: Span::default(),
+                unrecognized: Vec::new(),
             },
             Scenario {
                 name: "scenario D".into(),
@@ -918,6 +921,7 @@ mod tests {
                 depends_on: Vec::new(),
                 rule: None,
                 span: Span::default(),
+                unrecognized: Vec::new(),
             },
         ];
 

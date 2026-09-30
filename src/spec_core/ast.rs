@@ -158,6 +158,8 @@ pub enum ScenarioMode {
     #[default]
     Standard,
     Optimize,
+    /// Long-running: deferred by per-commit gates, run with `--include-soak`.
+    Soak,
 }
 
 impl ScenarioMode {
@@ -268,7 +270,19 @@ pub struct Scenario {
     /// Additive (Phase 1 BDD semantics); `None` for ungrouped/legacy scenarios.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rule: Option<String>,
+    /// `Mode:` / `Review:` values the parser did not recognize (they fell back
+    /// to `Standard` / `Auto`), kept so lint can report them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unrecognized: Vec<UnrecognizedField>,
     pub span: Span,
+}
+
+/// A scenario field value the parser did not recognize.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnrecognizedField {
+    /// `Mode` or `Review`.
+    pub field: String,
+    pub value: String,
 }
 
 impl Scenario {

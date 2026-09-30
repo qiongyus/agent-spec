@@ -67,6 +67,7 @@ fn verdict_str(verdict: Verdict) -> &'static str {
         Verdict::Skip => "skip",
         Verdict::Uncertain => "uncertain",
         Verdict::PendingReview => "pending_review",
+        Verdict::Deferred => "deferred",
     }
 }
 

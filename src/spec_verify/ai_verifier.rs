@@ -224,6 +224,7 @@ mod tests {
             depends_on: vec![],
             rule: None,
             span: Span::line(1),
+            unrecognized: Vec::new(),
         };
 
         VerificationContext {

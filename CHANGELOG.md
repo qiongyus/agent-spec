@@ -43,6 +43,19 @@ All notable changes to `agent-spec` are documented here. Format follows
   exited without cargo output; usually environmental). Test evidence records
   `exit_code`, `signal`, `ignored` and `failure_class`. agent-spec does not
   retry test runs.
+- Soak scenarios (LEP-007 → ADR-006 → REQ-SOAK-SCENARIOS): `Mode: soak` /
+  `模式: soak` marks a long-running scenario. `verify`, `lifecycle` and `guard`
+  do not run it by default; it is reported with the new verdict `deferred`
+  (counted in `summary.deferred`), which does not fail the default `auto`
+  review mode. `verify --include-soak` / `lifecycle --include-soak` run it with
+  `-- --include-ignored`, so the test can stay `#[ignore]`d for plain
+  `cargo test`. Acceptance paths refuse an unrun soak scenario: `lifecycle
+  --review-mode strict` and `resolve-ai` count `deferred` as non-passing. New
+  spec lint warnings: `soak-level-without-mode` (a selector says `Level: soak`
+  but the scenario is not `Mode: soak`), `unknown-scenario-mode` and
+  `unknown-review-mode` (an unrecognized value, which still falls back to
+  `Standard` / `Auto`). Pin an agent-spec version that knows `Mode: soak`:
+  older versions run such a scenario as a standard one.
 
 ### Changed
 

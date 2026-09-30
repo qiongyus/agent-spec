@@ -74,6 +74,7 @@ pub fn build_status_report(
             Verdict::Skip => "skip",
             Verdict::Uncertain => "uncertain",
             Verdict::PendingReview => "pending_review",
+            Verdict::Deferred => "deferred",
         };
         scenarios.insert(
             r.scenario_name.clone(),
@@ -200,6 +201,7 @@ fn format_verification_text(report: &VerificationReport) -> String {
             Verdict::Skip => "[SKIP]",
             Verdict::Uncertain => "[????]",
             Verdict::PendingReview => "[REVIEW]",
+            Verdict::Deferred => "[DEFER]",
         };
         out.push_str(&format!("  {icon} {}\n", result.scenario_name));
 
@@ -210,6 +212,7 @@ fn format_verification_text(report: &VerificationReport) -> String {
                 Verdict::Skip => "-",
                 Verdict::Uncertain => "?",
                 Verdict::PendingReview => "R",
+                Verdict::Deferred => "~",
             };
             out.push_str(&format!("    {step_icon} {}\n", step.step_text));
             if step.verdict == Verdict::Fail {
@@ -368,6 +371,7 @@ fn format_explain_text(input: &ExplainInput, report: &VerificationReport) -> Str
             Verdict::Skip => "[SKIP]",
             Verdict::Uncertain => "[????]",
             Verdict::PendingReview => "[REVIEW]",
+            Verdict::Deferred => "[DEFER]",
         };
         out.push_str(&format!("  {icon} {}\n", result.scenario_name));
         for ev in &result.evidence {
@@ -458,6 +462,7 @@ fn format_explain_md(input: &ExplainInput, report: &VerificationReport) -> Strin
             Verdict::Skip => "⏭️",
             Verdict::Uncertain => "❓",
             Verdict::PendingReview => "👁️",
+            Verdict::Deferred => "⏸️",
         };
         out.push_str(&format!("- {icon} {}\n", result.scenario_name));
         for ev in &result.evidence {
@@ -642,6 +647,7 @@ fn format_verification_compact(report: &VerificationReport) -> String {
             Verdict::Skip => "\u{2298}", // ⊘
             Verdict::Uncertain => "?",
             Verdict::PendingReview => "\u{2299}", // ⊙
+            Verdict::Deferred => "\u{23f8}",      // ⏸
         };
         parts.push(format!("{icon} {}", r.scenario_name));
     }
@@ -694,6 +700,7 @@ fn format_verification_md(report: &VerificationReport) -> String {
             Verdict::Skip => "⏭️",
             Verdict::Uncertain => "❓",
             Verdict::PendingReview => "👁️",
+            Verdict::Deferred => "⏸️",
         };
         out.push_str(&format!("### {icon} {}\n\n", result.scenario_name));
 
@@ -704,6 +711,7 @@ fn format_verification_md(report: &VerificationReport) -> String {
                 Verdict::Skip => "⏭️",
                 Verdict::Uncertain => "❓",
                 Verdict::PendingReview => "👁️",
+                Verdict::Deferred => "⏸️",
             };
             out.push_str(&format!("- {s} {}\n", step.step_text));
         }
@@ -776,6 +784,7 @@ mod tests {
                 skipped: 0,
                 uncertain: 0,
                 pending_review: 0,
+                deferred: 0,
             },
         };
         let text = format_verification(&report, &OutputFormat::Text);
@@ -811,6 +820,7 @@ mod tests {
                 skipped: 0,
                 uncertain: 1,
                 pending_review: 0,
+                deferred: 0,
             },
         };
 
@@ -848,6 +858,7 @@ mod tests {
                 skipped: 0,
                 uncertain: 0,
                 pending_review: 0,
+                deferred: 0,
             },
         };
 
@@ -896,6 +907,7 @@ mod tests {
                 skipped: 0,
                 uncertain: 0,
                 pending_review: 0,
+                deferred: 0,
             },
         };
 
@@ -989,6 +1001,7 @@ mod tests {
                 skipped: 0,
                 uncertain: 0,
                 pending_review: 0,
+                deferred: 0,
             },
         }
     }
@@ -1029,6 +1042,7 @@ mod tests {
                 skipped: 1,
                 uncertain: 0,
                 pending_review: 0,
+                deferred: 0,
             },
         }
     }
@@ -1126,6 +1140,7 @@ mod tests {
                 skipped: 0,
                 uncertain: 0,
                 pending_review: 0,
+                deferred: 0,
             },
         };
 

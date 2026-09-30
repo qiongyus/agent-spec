@@ -17,7 +17,7 @@ pub use atlas_symbols::AtlasSymbolVerifier;
 pub use boundaries::BoundariesVerifier;
 pub use complexity::ComplexityVerifier;
 pub use structural::StructuralVerifier;
-pub use test_verifier::TestVerifier;
+pub use test_verifier::{TestRunOptions, TestVerifier};
 
 /// AI verifier mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,6 +174,7 @@ mod tests {
             depends_on: vec![],
             rule: None,
             span: Span::line(1),
+            unrecognized: Vec::new(),
         };
         let ctx = VerificationContext {
             code_paths: vec![PathBuf::from(".")],

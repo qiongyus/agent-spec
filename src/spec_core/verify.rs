@@ -10,6 +10,8 @@ pub enum Verdict {
     Skip,
     Uncertain,
     PendingReview,
+    /// A soak scenario the run did not execute (no `--include-soak`).
+    Deferred,
 }
 
 /// Whether a verdict came from mechanical execution or AI inference.
@@ -206,6 +208,9 @@ pub struct VerificationSummary {
     pub uncertain: usize,
     #[serde(default)]
     pub pending_review: usize,
+    /// Soak scenarios not run by this verification.
+    #[serde(default)]
+    pub deferred: usize,
 }
 
 impl VerificationSummary {
@@ -248,6 +253,10 @@ impl VerificationReport {
             .iter()
             .filter(|r| r.verdict == Verdict::PendingReview)
             .count();
+        let deferred = results
+            .iter()
+            .filter(|r| r.verdict == Verdict::Deferred)
+            .count();
 
         Self {
             spec_name,
@@ -259,6 +268,7 @@ impl VerificationReport {
                 skipped,
                 uncertain,
                 pending_review,
+                deferred,
             },
         }
     }

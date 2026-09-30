@@ -206,7 +206,8 @@ pub fn build_verification_questions(
             Verdict::Skip => "skip",
             Verdict::Uncertain => "uncertain",
             Verdict::PendingReview => "pending-review",
-            Verdict::Pass | Verdict::Fail => continue,
+            // A deferred soak scenario awaits a run, not a judgment.
+            Verdict::Pass | Verdict::Fail | Verdict::Deferred => continue,
         };
         let evidence = result
             .evidence

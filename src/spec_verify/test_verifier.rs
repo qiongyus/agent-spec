@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::spec_core::{
-    Evidence, ReviewMode, Scenario, ScenarioResult, SpecError, SpecResult, StepVerdict,
-    TestOutputDetail, TestSelector, Verdict,
+    Evidence, ReviewMode, Scenario, ScenarioMode, ScenarioResult, SpecError, SpecResult,
+    StepVerdict, TestOutputDetail, TestSelector, Verdict,
 };
 
 use super::{VerificationContext, Verifier};
@@ -17,6 +17,15 @@ use super::{VerificationContext, Verifier};
 /// without spawning cargo; production uses [`CargoRunner`].
 pub struct TestVerifier {
     runner: Arc<dyn TestCommandRunner>,
+    options: TestRunOptions,
+}
+
+/// How bound tests are run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TestRunOptions {
+    /// Run `Mode: soak` scenarios (with `--include-ignored`) instead of
+    /// reporting them `deferred`.
+    pub include_soak: bool,
 }
 
 impl Default for TestVerifier {
@@ -27,7 +36,15 @@ impl Default for TestVerifier {
 
 impl TestVerifier {
     pub fn with_runner(runner: Arc<dyn TestCommandRunner>) -> Self {
-        Self { runner }
+        Self {
+            runner,
+            options: TestRunOptions::default(),
+        }
+    }
+
+    pub fn with_options(mut self, options: TestRunOptions) -> Self {
+        self.options = options;
+        self
     }
 }
 
@@ -117,11 +134,19 @@ impl Verifier for TestVerifier {
             let Some(binding) = resolve_test_binding(scenario, &legacy_bindings) else {
                 continue;
             };
+            let soak = scenario.mode == ScenarioMode::Soak;
+            if soak && !self.options.include_soak {
+                results.push(deferred_result(scenario));
+                continue;
+            }
 
+            let mut args = build_cargo_test_args(&binding.selector);
+            if soak {
+                // A soak test may stay #[ignore]d for plain `cargo test`.
+                args.extend(["--".to_string(), "--include-ignored".to_string()]);
+            }
             let started = Instant::now();
-            let run = self
-                .runner
-                .run(&build_cargo_test_args(&binding.selector), &workspace_root)?;
+            let run = self.runner.run(&args, &workspace_root)?;
             let duration_ms = started.elapsed().as_millis() as u64;
 
             let combined = combine_output(&run.stdout, &run.stderr);
@@ -151,6 +176,27 @@ impl Verifier for TestVerifier {
         }
 
         Ok(results)
+    }
+}
+
+/// A soak scenario the run does not execute: reported, never run.
+fn deferred_result(scenario: &Scenario) -> ScenarioResult {
+    let reason = "soak scenario deferred; run with --include-soak".to_string();
+    ScenarioResult {
+        scenario_name: scenario.name.clone(),
+        verdict: Verdict::Deferred,
+        step_results: scenario
+            .steps
+            .iter()
+            .map(|step| StepVerdict {
+                step_text: step.text.clone(),
+                verdict: Verdict::Deferred,
+                reason: reason.clone(),
+            })
+            .collect(),
+        evidence: Vec::new(),
+        duration_ms: 0,
+        provenance: None,
     }
 }
 
@@ -516,9 +562,9 @@ mod tests {
     use crate::spec_core::{ReviewMode, Scenario, Span, TestSelector, Verdict};
 
     use super::{
-        BindingSource, TestCommandRunner, TestExit, TestRun, TestVerifier, build_cargo_test_args,
-        extract_bindings, judge_test_run, judgment_reason, parse_libtest_summary,
-        resolve_test_binding, test_output_evidence,
+        BindingSource, TestCommandRunner, TestExit, TestRun, TestRunOptions, TestVerifier,
+        build_cargo_test_args, extract_bindings, judge_test_run, judgment_reason,
+        parse_libtest_summary, resolve_test_binding, test_output_evidence,
     };
     use crate::spec_verify::Verifier;
 
@@ -758,6 +804,85 @@ mod tests {
 
     const ONE_SCENARIO_SPEC: &str = "spec: task\nname: \"Probe\"\n---\n\n## Completion Criteria\n\nScenario: probe case\n  Test: probe_case\n  Given a bound test\n  When it is verified\n  Then a verdict is recorded\n";
 
+    struct RecordingRunner {
+        calls: std::sync::Mutex<Vec<Vec<String>>>,
+        stdout: String,
+    }
+
+    impl TestCommandRunner for RecordingRunner {
+        fn run(
+            &self,
+            args: &[String],
+            _cwd: &std::path::Path,
+        ) -> crate::spec_core::SpecResult<TestRun> {
+            self.calls.lock().unwrap().push(args.to_vec());
+            Ok(TestRun {
+                exit: exit(101),
+                stdout: self.stdout.clone(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    const SOAK_SPEC: &str = "spec: task\nname: \"Soak\"\n---\n\n## Completion Criteria\n\nScenario: long run\n  Mode: soak\n  Test: soak_case\n  Given a long-running test\n  When it is verified\n  Then it is deferred by default\n";
+
+    fn verify_soak(
+        options: TestRunOptions,
+    ) -> (Vec<Vec<String>>, Vec<crate::spec_core::ScenarioResult>) {
+        let runner = std::sync::Arc::new(RecordingRunner {
+            calls: Default::default(),
+            stdout: format!(
+                "running 1 test\ntest tests::soak_case ... FAILED\n{}\n",
+                summary_line(0, 1, 0)
+            ),
+        });
+        let dir = std::env::temp_dir().join(format!(
+            "agent-spec-soak-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"probe\"\n").unwrap();
+        let doc = crate::spec_parser::parse_spec_from_str(SOAK_SPEC).unwrap();
+        let ctx = crate::spec_verify::VerificationContext {
+            code_paths: vec![dir.clone()],
+            change_paths: Vec::new(),
+            ai_mode: crate::spec_verify::AiMode::Off,
+            resolved_spec: crate::spec_parser::resolve_spec(doc, &[]).unwrap(),
+        };
+        let results = TestVerifier::with_runner(runner.clone())
+            .with_options(options)
+            .verify(&ctx)
+            .unwrap();
+        std::fs::remove_dir_all(dir).ok();
+        let calls = runner.calls.lock().unwrap().clone();
+        (calls, results)
+    }
+
+    #[test]
+    fn test_soak_scenario_is_deferred_without_running_tests() {
+        let (calls, results) = verify_soak(TestRunOptions::default());
+        assert!(calls.is_empty(), "{calls:?}");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].verdict, Verdict::Deferred);
+        assert!(results[0].step_results[0].reason.contains("--include-soak"));
+    }
+
+    #[test]
+    fn test_include_soak_runs_with_include_ignored() {
+        let (calls, results) = verify_soak(TestRunOptions { include_soak: true });
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0].ends_with(&strings(&["soak_case", "--", "--include-ignored"])),
+            "{:?}",
+            calls[0]
+        );
+        assert_eq!(results[0].verdict, Verdict::Fail);
+    }
+
     #[test]
     fn test_runner_exit_is_not_retried() {
         let runner = std::sync::Arc::new(CountingRunner {
@@ -816,6 +941,7 @@ fn helper() {}
             depends_on: vec![],
             rule: None,
             span: Span::default(),
+            unrecognized: Vec::new(),
         };
         let legacy = HashMap::from([("场景一".to_string(), "legacy_test_name".to_string())]);
 
@@ -841,6 +967,7 @@ fn helper() {}
             depends_on: vec![],
             rule: None,
             span: Span::default(),
+            unrecognized: Vec::new(),
         };
         let legacy = HashMap::from([(
             "场景一".to_string(),

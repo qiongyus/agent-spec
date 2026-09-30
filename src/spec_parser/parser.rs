@@ -1,7 +1,7 @@
 use crate::spec_core::{
     BehaviorRule, Boundary, BoundaryCategory, Constraint, ConstraintCategory, MalformedRule,
     ReviewMode, RuleKey, RuleScope, Scenario, ScenarioMode, Section, Span, SpecDocument, SpecError,
-    SpecResult, Step, TestSelector,
+    SpecResult, Step, TestSelector, UnrecognizedField,
 };
 use std::path::{Path, PathBuf};
 
@@ -319,6 +319,7 @@ fn parse_scenarios(lines: &[(usize, &str)], rule_scope: &RuleScope) -> SpecResul
     let mut current_tags: Vec<String> = Vec::new();
     let mut current_review: ReviewMode = ReviewMode::default();
     let mut current_mode: ScenarioMode = ScenarioMode::Standard;
+    let mut current_unrecognized: Vec<UnrecognizedField> = Vec::new();
     let mut current_depends_on: Vec<String> = Vec::new();
     let mut reading_test_selector_block = false;
     // The active behavior rule id for scenarios that follow a `Rule:` header.
@@ -346,6 +347,7 @@ fn parse_scenarios(lines: &[(usize, &str)], rule_scope: &RuleScope) -> SpecResul
                 mode: $mode,
                 depends_on: $depends,
                 rule: rule_id,
+                unrecognized: std::mem::take(&mut current_unrecognized),
                 span: Span::new($start, 0, $end, 0),
             });
         }};
@@ -419,6 +421,7 @@ fn parse_scenarios(lines: &[(usize, &str)], rule_scope: &RuleScope) -> SpecResul
             current_tags = Vec::new();
             current_review = ReviewMode::default();
             current_mode = ScenarioMode::Standard;
+            current_unrecognized = Vec::new();
             current_depends_on = Vec::new();
             current_scenario_rule = current_rule_id.clone();
             reading_test_selector_block = false;
@@ -428,21 +431,32 @@ fn parse_scenarios(lines: &[(usize, &str)], rule_scope: &RuleScope) -> SpecResul
             }
         } else if let Some(review_value) = match_review_field(line) {
             if current_name.is_some() {
-                let lower = review_value.to_lowercase();
-                if lower == "human" {
-                    current_review = ReviewMode::Human;
-                } else {
-                    current_review = ReviewMode::Auto;
-                }
+                current_review = match review_value.to_lowercase().as_str() {
+                    "human" => ReviewMode::Human,
+                    "auto" => ReviewMode::Auto,
+                    _ => {
+                        current_unrecognized.push(UnrecognizedField {
+                            field: "Review".into(),
+                            value: review_value.to_string(),
+                        });
+                        ReviewMode::Auto
+                    }
+                };
             }
         } else if let Some(mode_value) = match_mode_field(line) {
             if current_name.is_some() {
-                let lower = mode_value.to_lowercase();
-                if lower == "optimize" {
-                    current_mode = ScenarioMode::Optimize;
-                } else {
-                    current_mode = ScenarioMode::Standard;
-                }
+                current_mode = match mode_value.to_lowercase().as_str() {
+                    "optimize" => ScenarioMode::Optimize,
+                    "soak" => ScenarioMode::Soak,
+                    "standard" => ScenarioMode::Standard,
+                    _ => {
+                        current_unrecognized.push(UnrecognizedField {
+                            field: "Mode".into(),
+                            value: mode_value.to_string(),
+                        });
+                        ScenarioMode::Standard
+                    }
+                };
             }
         } else if let Some(depends_value) = match_depends_field(line) {
             if current_name.is_some() {
@@ -1019,6 +1033,85 @@ Scenario: english features
             features,
             vec![Some("fault-injection,slow-io"), Some("fault-injection")]
         );
+    }
+
+    const SOAK_AND_UNKNOWN_SPEC: &str = r#"spec: task
+name: "soak"
+---
+
+## Completion Criteria
+
+Scenario: english soak
+  Mode: soak
+  Test: soak_one
+  Given a long-running test
+  When the spec is parsed
+  Then the mode is soak
+
+场景: 中文 soak
+  模式：soak
+  测试: soak_two
+  假设 一个长时运行的测试
+  当 解析该 spec
+  那么 mode 为 soak
+
+Scenario: level soak without mode
+  Test:
+    Filter: soak_three
+    Level: soak
+  Given a selector level of soak
+  When the spec is linted
+  Then a warning is reported
+
+Scenario: unknown values
+  Mode: soke
+  Review: humans
+  Test: typo_case
+  Given typo values
+  When the spec is parsed
+  Then they fall back
+"#;
+
+    fn soak_scenarios() -> Vec<crate::spec_core::Scenario> {
+        let doc = parse_spec_from_str(SOAK_AND_UNKNOWN_SPEC).unwrap();
+        let Section::AcceptanceCriteria { scenarios, .. } = &doc.sections[0] else {
+            panic!("expected AcceptanceCriteria");
+        };
+        scenarios.clone()
+    }
+
+    fn lint_rules(rule: &str) -> usize {
+        let doc = parse_spec_from_str(SOAK_AND_UNKNOWN_SPEC).unwrap();
+        crate::spec_lint::LintPipeline::with_defaults()
+            .run(&doc)
+            .diagnostics
+            .iter()
+            .filter(|diag| {
+                diag.rule == rule && diag.severity == crate::spec_core::Severity::Warning
+            })
+            .count()
+    }
+
+    #[test]
+    fn test_parse_soak_mode_in_both_languages() {
+        let scenarios = soak_scenarios();
+        assert_eq!(scenarios[0].mode, crate::spec_core::ScenarioMode::Soak);
+        assert_eq!(scenarios[1].mode, crate::spec_core::ScenarioMode::Soak);
+        assert!(scenarios[0].unrecognized.is_empty());
+    }
+
+    #[test]
+    fn test_lint_warns_soak_level_without_mode() {
+        assert_eq!(lint_rules("soak-level-without-mode"), 1);
+    }
+
+    #[test]
+    fn test_lint_warns_unknown_mode_and_review_values() {
+        let scenarios = soak_scenarios();
+        assert_eq!(scenarios[3].mode, crate::spec_core::ScenarioMode::Standard);
+        assert_eq!(scenarios[3].review, crate::spec_core::ReviewMode::Auto);
+        assert_eq!(lint_rules("unknown-scenario-mode"), 1);
+        assert_eq!(lint_rules("unknown-review-mode"), 1);
     }
 
     #[test]

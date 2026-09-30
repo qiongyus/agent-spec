@@ -82,6 +82,10 @@ pub struct RequirementSpecCoverage {
     pub requirement_id: String,
     pub spec_paths: Vec<PathBuf>,
     pub spec_depends: Vec<String>,
+    /// Contracts under `specs/roadmap/` (the staged tier `requirements status`
+    /// reports): scheduled coverage, never an active plan spec node.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub staged_spec_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -104,6 +108,7 @@ pub fn build_requirement_plan(knowledge_dir: &Path, specs_dir: &Path) -> Require
 
     let work_units = build_work_units(&graph);
     let (spec_nodes, coverage_by_req, mut spec_diagnostics) = collect_spec_coverage(specs_dir);
+    let staged_by_req = collect_staged_coverage(specs_dir);
 
     let requirements = work_units
         .units
@@ -207,6 +212,7 @@ pub fn build_requirement_plan(knowledge_dir: &Path, specs_dir: &Path) -> Require
             requirement_id,
             spec_paths: spec_info.spec_paths,
             spec_depends: spec_info.spec_depends,
+            staged_spec_paths: Vec::new(),
         })
         .collect::<Vec<_>>();
 
@@ -216,7 +222,22 @@ pub fn build_requirement_plan(knowledge_dir: &Path, specs_dir: &Path) -> Require
                 requirement_id: req.id.clone(),
                 spec_paths: Vec::new(),
                 spec_depends: Vec::new(),
+                staged_spec_paths: Vec::new(),
             });
+        }
+    }
+    for (requirement_id, staged_paths) in staged_by_req {
+        match coverage
+            .iter_mut()
+            .find(|entry| entry.requirement_id == requirement_id)
+        {
+            Some(entry) => entry.staged_spec_paths = staged_paths,
+            None => coverage.push(RequirementSpecCoverage {
+                requirement_id,
+                spec_paths: Vec::new(),
+                spec_depends: Vec::new(),
+                staged_spec_paths: staged_paths,
+            }),
         }
     }
 
@@ -343,6 +364,24 @@ fn collect_spec_coverage(
         }
     }
     (specs, out, diagnostics)
+}
+
+/// Index the staged tier exactly as `requirements status` does: the
+/// `roadmap/` subdirectory of the specs root, `REQ-` ids only.
+fn collect_staged_coverage(specs_dir: &Path) -> BTreeMap<String, Vec<PathBuf>> {
+    let roadmap = specs_dir.join("roadmap");
+    if !roadmap.is_dir() {
+        return BTreeMap::new();
+    }
+    crate::spec_knowledge::build_satisfies_index(&roadmap)
+        .into_iter()
+        .filter(|(requirement_id, _)| requirement_id.starts_with("REQ-"))
+        .map(|(requirement_id, mut paths)| {
+            paths.sort();
+            paths.dedup();
+            (requirement_id, paths)
+        })
+        .collect()
 }
 
 fn spec_id_from_path(path: &Path) -> Option<String> {
@@ -479,24 +518,54 @@ pub fn validate_requirement_plan(plan: &RequirementPlan) -> Vec<RequirementPlanD
                 .coverage
                 .iter()
                 .find(|entry| entry.requirement_id == node.id);
-            if coverage.is_none_or(|entry| entry.spec_paths.is_empty()) {
-                diagnostics.push(RequirementPlanDiagnostic {
-                    code: "requirement-uncovered".into(),
-                    severity: "error".into(),
+            let active = coverage.map_or(0, |entry| entry.spec_paths.len());
+            let staged = coverage.map_or(0, |entry| entry.staged_spec_paths.len());
+            let diagnostic =
+                |code: &str, severity: &str, message: String| RequirementPlanDiagnostic {
+                    code: code.into(),
+                    severity: severity.into(),
                     requirement_id: Some(node.id.clone()),
-                    message: format!("{} is ready but has no satisfying spec", node.id),
-                });
-            }
-            if coverage.is_some_and(|entry| entry.spec_paths.len() > 1) {
-                diagnostics.push(RequirementPlanDiagnostic {
-                    code: "requirement-multiple-specs".into(),
-                    severity: "error".into(),
-                    requirement_id: Some(node.id.clone()),
-                    message: format!(
+                    message,
+                };
+            match (active, staged) {
+                (0, 0) => diagnostics.push(diagnostic(
+                    "requirement-uncovered",
+                    "error",
+                    format!("{} is ready but has no satisfying spec", node.id),
+                )),
+                (0, 1) => diagnostics.push(diagnostic(
+                    "requirement-staged",
+                    "info",
+                    format!(
+                        "{} is scheduled, not yet active: its only satisfying spec is staged under roadmap/",
+                        node.id
+                    ),
+                )),
+                (0, _) => diagnostics.push(diagnostic(
+                    "requirement-multiple-staged-specs",
+                    "error",
+                    format!(
+                        "{} has {staged} staged satisfying specs and no active one; one ready work unit requires one task contract",
+                        node.id
+                    ),
+                )),
+                (1, 0) => {}
+                (1, _) => diagnostics.push(diagnostic(
+                    "requirement-staged-and-active",
+                    "warning",
+                    format!(
+                        "{} has an active spec and a staged copy under roadmap/; remove the staged copy left behind by promotion",
+                        node.id
+                    ),
+                )),
+                _ => diagnostics.push(diagnostic(
+                    "requirement-multiple-specs",
+                    "error",
+                    format!(
                         "{} has multiple satisfying specs; one ready work unit requires one task contract",
                         node.id
                     ),
-                });
+                )),
             }
         }
         if node.status == RequirementPlanStatus::Blocked {
@@ -643,6 +712,7 @@ mod tests {
                 requirement_id: "REQ-UNCOVERED".into(),
                 spec_paths: Vec::new(),
                 spec_depends: Vec::new(),
+                staged_spec_paths: Vec::new(),
             }],
             diagnostics: Vec::new(),
             parse_errors: Vec::new(),
@@ -821,6 +891,126 @@ mod tests {
         assert!(!plan.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == "duplicate-spec-id" || diagnostic.code == "requirement-uncovered"
         }));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// A workspace with one ready requirement `REQ-S` satisfied by `active`
+    /// top-level specs and `staged` specs under `specs/roadmap/`.
+    fn staged_fixture(prefix: &str, active: usize, staged: usize) -> (PathBuf, RequirementPlan) {
+        let dir = make_temp_dir(prefix);
+        let knowledge = dir.join("knowledge");
+        let specs = dir.join("specs");
+        fs::create_dir_all(knowledge.join("requirements")).unwrap();
+        fs::create_dir_all(&specs).unwrap();
+        fs::write(
+            knowledge.join("requirements/req-s.md"),
+            "---\nkind: requirement\nid: REQ-S\ntitle: \"S\"\nstatus: accepted\nliveness: auto\n---\n## Problem\nS.\n## Requirements\n[REQ-S] The system MUST do S.\n## Scenarios\nScenario: S\n  Given input S\n  When S runs\n  Then output S is visible\n## Source Trace\n- test\n## Open Questions\nNone.\n",
+        )
+        .unwrap();
+        let spec = |name: &str| {
+            format!(
+                "spec: task\nname: \"{name}\"\nsatisfies: [REQ-S]\n---\n## Intent\nS.\n## Completion Criteria\nScenario: S\n  Test: test_s_one\n  Given S\n  When S\n  Then S\n"
+            )
+        };
+        for index in 0..active {
+            fs::write(
+                specs.join(format!("task-active-{index}.spec.md")),
+                spec(&format!("active {index}")),
+            )
+            .unwrap();
+        }
+        if staged > 0 {
+            fs::create_dir_all(specs.join("roadmap")).unwrap();
+        }
+        for index in 0..staged {
+            fs::write(
+                specs.join(format!("roadmap/task-staged-{index}.spec.md")),
+                spec(&format!("staged {index}")),
+            )
+            .unwrap();
+        }
+        let plan = build_requirement_plan(&knowledge, &specs);
+        (dir, plan)
+    }
+
+    fn has_diag(plan: &RequirementPlan, code: &str, severity: &str) -> bool {
+        plan.diagnostics
+            .iter()
+            .any(|diag| diag.code == code && diag.severity == severity)
+    }
+
+    fn has_code(plan: &RequirementPlan, code: &str) -> bool {
+        plan.diagnostics.iter().any(|diag| diag.code == code)
+    }
+
+    #[test]
+    fn test_requirement_plan_counts_single_staged_spec_as_scheduled() {
+        let (dir, plan) = staged_fixture("plan-staged-only", 0, 1);
+        let coverage = plan
+            .coverage
+            .iter()
+            .find(|entry| entry.requirement_id == "REQ-S")
+            .unwrap();
+        assert!(coverage.spec_paths.is_empty());
+        assert_eq!(coverage.staged_spec_paths.len(), 1);
+        assert!(coverage.staged_spec_paths[0].ends_with("roadmap/task-staged-0.spec.md"));
+        assert!(has_diag(&plan, "requirement-staged", "info"));
+        assert!(!has_code(&plan, "requirement-uncovered"));
+        assert!(
+            plan.specs.is_empty(),
+            "a staged contract is not an active plan spec node"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn test_requirement_plan_still_reports_uncovered_without_any_spec() {
+        let (dir, plan) = staged_fixture("plan-staged-none", 0, 0);
+        assert!(has_diag(&plan, "requirement-uncovered", "error"));
+        assert!(!has_code(&plan, "requirement-staged"));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn test_requirement_plan_rejects_multiple_staged_specs() {
+        let (dir, plan) = staged_fixture("plan-staged-many", 0, 2);
+        assert!(has_diag(
+            &plan,
+            "requirement-multiple-staged-specs",
+            "error"
+        ));
+        assert!(!has_code(&plan, "requirement-uncovered"));
+        assert!(!has_code(&plan, "requirement-staged"));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn test_requirement_plan_warns_when_staged_copy_is_left_behind() {
+        let (dir, plan) = staged_fixture("plan-staged-left-behind", 1, 1);
+        assert!(has_diag(&plan, "requirement-staged-and-active", "warning"));
+        assert!(!has_code(&plan, "requirement-uncovered"));
+        assert!(!has_code(&plan, "requirement-staged"));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn test_requirement_plan_multiple_active_specs_ignore_staged_count() {
+        let (dir, plan) = staged_fixture("plan-staged-multi-active", 2, 1);
+        assert!(has_diag(&plan, "requirement-multiple-specs", "error"));
+        assert!(!has_code(&plan, "requirement-staged-and-active"));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn test_requirement_plan_json_omits_empty_staged_paths() {
+        let (dir, plan) = staged_fixture("plan-staged-json", 1, 0);
+        let json = serde_json::to_string(&plan).unwrap();
+        assert!(!json.contains("staged_spec_paths"));
+        fs::remove_dir_all(dir).ok();
+
+        let (dir, plan) = staged_fixture("plan-staged-json-present", 0, 1);
+        let json = serde_json::to_string(&plan).unwrap();
+        assert!(json.contains("staged_spec_paths"));
         fs::remove_dir_all(dir).ok();
     }
 }

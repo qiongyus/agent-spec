@@ -8529,6 +8529,57 @@ name: "退款"
         let _ = fs::remove_dir_all(dir);
     }
 
+    const STAGED_A_SPEC: &str = "spec: task\nname: \"A\"\nsatisfies: [REQ-A]\n---\n## Intent\nA.\n## Completion Criteria\nScenario: A\n  Test: test_a\n  Given A\n  When A\n  Then A\n";
+
+    #[test]
+    fn test_lint_knowledge_gate_passes_with_only_staged_coverage() {
+        let (dir, knowledge, specs) =
+            knowledge_gate_fixture("knowledge-gate-staged", true, STAGED_A_SPEC);
+        fs::create_dir_all(specs.join("roadmap")).unwrap();
+        fs::rename(
+            specs.join("task-a.spec.md"),
+            specs.join("roadmap/task-a.spec.md"),
+        )
+        .unwrap();
+        let (_, findings) = super::knowledge_gate_findings(
+            &knowledge,
+            &specs,
+            &dir.join("absent.json"),
+            &dir.join("absent-clauses.json"),
+        );
+        let errors = findings
+            .iter()
+            .filter(|f| f.diag.severity == crate::spec_core::Severity::Error)
+            .map(|f| f.diag.rule.clone())
+            .collect::<Vec<_>>();
+        assert!(errors.is_empty(), "unexpected gate errors: {errors:?}");
+        let staged = findings
+            .iter()
+            .find(|f| f.diag.rule == "requirement-staged")
+            .expect("staged coverage must reach the knowledge gate");
+        assert_eq!(staged.diag.severity, crate::spec_core::Severity::Info);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_lint_knowledge_gate_fails_on_uncovered_requirement() {
+        let (dir, knowledge, specs) =
+            knowledge_gate_fixture("knowledge-gate-uncovered", true, STAGED_A_SPEC);
+        fs::remove_file(specs.join("task-a.spec.md")).unwrap();
+        let (_, findings) = super::knowledge_gate_findings(
+            &knowledge,
+            &specs,
+            &dir.join("absent.json"),
+            &dir.join("absent-clauses.json"),
+        );
+        let uncovered = findings
+            .iter()
+            .find(|f| f.diag.rule == "requirement-uncovered")
+            .expect("an uncovered ready requirement must fail the gate");
+        assert_eq!(uncovered.diag.severity, crate::spec_core::Severity::Error);
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn test_orphan_spec_is_warning_with_current_remedies() {
         let (dir, knowledge, specs) = knowledge_gate_fixture(
@@ -9794,6 +9845,7 @@ name: "退款"
                 requirement_id: "REQ-NOTE-CREATE".into(),
                 spec_paths: vec![PathBuf::from("specs/task-req-note-create.spec.md")],
                 spec_depends: Vec::new(),
+                staged_spec_paths: Vec::new(),
             }],
             diagnostics: Vec::new(),
             parse_errors: Vec::new(),

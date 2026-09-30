@@ -15,6 +15,17 @@ All notable changes to `agent-spec` are documented here. Format follows
   exposes the enclosing heading as an optional `group` field on each clause and
   scenario (omitted when absent, so ungrouped documents serialize unchanged).
   `### Rule: <id>` lines keep their clause-attribution meaning.
+- Staged coverage (LEP-007 → ADR-006 → REQ-STAGED-COVERAGE): `requirements plan`
+  indexes `specs/roadmap/` as the staged tier (the one `requirements status`
+  already reports). A ready requirement whose only contract is staged reports
+  Info `requirement-staged` instead of Error `requirement-uncovered`, so
+  `lint-knowledge --gate` and `guard` can both be green while the
+  specification runs one round ahead of implementation. Two staged contracts
+  and no active one is Error `requirement-multiple-staged-specs`; an active
+  contract with a staged copy left behind is Warning
+  `requirement-staged-and-active`. Plan coverage gains `staged_spec_paths`
+  (omitted when empty), and `requirements test-obligations` takes a single
+  staged contract as the obligation source, marked `tier: "staged"`.
 
 ## [1.4.0] - 2026-08-14
 

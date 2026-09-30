@@ -23,6 +23,10 @@ pub struct TestObligation {
     pub selector_authority: String,
     pub verification_strength: String,
     pub spec_path: Option<PathBuf>,
+    /// `Some("staged")` when `spec_path` is the requirement's single staged
+    /// (`specs/roadmap/`) contract because no active contract exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
     pub required_evidence: Vec<QaEvidenceKind>,
 }
 
@@ -64,12 +68,21 @@ pub fn build_test_obligations(knowledge_dir: &Path, specs_dir: &Path) -> TestObl
     );
 
     for node in graph.nodes {
-        let spec_paths = plan
+        let coverage = plan
             .coverage
             .iter()
-            .find(|coverage| coverage.requirement_id == node.id)
+            .find(|coverage| coverage.requirement_id == node.id);
+        let active_paths = coverage
             .map(|coverage| coverage.spec_paths.clone())
             .unwrap_or_default();
+        let staged_paths = coverage
+            .map(|coverage| coverage.staged_spec_paths.clone())
+            .unwrap_or_default();
+        let (spec_paths, tier) = if active_paths.is_empty() && staged_paths.len() == 1 {
+            (staged_paths, Some("staged".to_string()))
+        } else {
+            (active_paths, None)
+        };
         let spec_doc = spec_paths
             .first()
             .and_then(|path| crate::spec_parser::parse_spec(path).ok());
@@ -99,6 +112,7 @@ pub fn build_test_obligations(knowledge_dir: &Path, specs_dir: &Path) -> TestObl
                 explicit_selector,
                 verification_strength: "contract".into(),
                 spec_path: spec_paths.first().cloned(),
+                tier: tier.clone(),
                 required_evidence: required_evidence_for(qa_class),
             });
         }
@@ -257,6 +271,42 @@ mod tests {
                 .iter()
                 .any(|diag| { diag.code == "spec-root-missing" && diag.severity == "error" })
         );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn test_test_obligations_fall_back_to_single_staged_spec() {
+        let dir = make_temp_dir("test-obligations-staged");
+        let knowledge = dir.join("knowledge");
+        let specs = dir.join("specs");
+        fs::create_dir_all(knowledge.join("requirements")).unwrap();
+        fs::create_dir_all(specs.join("roadmap")).unwrap();
+        fs::write(
+            knowledge.join("requirements/req-s.md"),
+            "---\nkind: requirement\nid: REQ-S\ntitle: \"S\"\nstatus: accepted\nliveness: auto\n---\n## Problem\nS.\n## Requirements\n[REQ-S] The system MUST do S.\n## Scenarios\nScenario: S one\n  Given input S\n  When S runs\n  Then output S is visible\n## Source Trace\n- test\n## Open Questions\nNone.\n",
+        )
+        .unwrap();
+        let staged = specs.join("roadmap/task-s.spec.md");
+        fs::write(
+            &staged,
+            "spec: task\nname: \"S\"\nsatisfies: [REQ-S]\n---\n## Intent\nS.\n## Completion Criteria\nScenario: S one\n  Test: test_s_one\n  Given S\n  When S\n  Then S\n",
+        )
+        .unwrap();
+
+        let obligations = build_test_obligations(&knowledge, &specs);
+        let obligation = &obligations.obligations[0];
+        assert_eq!(obligation.spec_path.as_deref(), Some(staged.as_path()));
+        assert_eq!(obligation.tier.as_deref(), Some("staged"));
+        assert_eq!(obligation.explicit_selector.as_deref(), Some("test_s_one"));
+        assert!(
+            !obligations
+                .diagnostics
+                .iter()
+                .any(|diag| diag.code == "test-obligation-missing-spec"),
+            "a staged contract is a spec source for obligations"
+        );
+        let json = serde_json::to_string(&obligations).unwrap();
+        assert!(json.contains("\"tier\":\"staged\""));
         fs::remove_dir_all(dir).ok();
     }
 }

@@ -9,8 +9,135 @@ use super::{VerificationContext, Verifier};
 /// Mechanical verifier for file-level task boundaries.
 ///
 /// This verifier only runs when callers provide an explicit `change_paths` set.
-/// It does not infer diffs from VCS state.
-pub struct BoundariesVerifier;
+/// It does not infer diffs from VCS state. `exempt` paths (workspace-relative)
+/// skip the `Allowed changes` check but are still held to `Forbidden`: guard
+/// uses them for changes that belong to another contract or are the
+/// contract's own file.
+#[derive(Debug, Clone, Default)]
+pub struct BoundariesVerifier {
+    exempt: Vec<String>,
+}
+
+impl BoundariesVerifier {
+    pub fn with_exempt(exempt: Vec<String>) -> Self {
+        Self { exempt }
+    }
+}
+
+/// One active contract's territory as guard sees it: its file and the paths
+/// its `Allowed changes` list claims.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContractTerritory {
+    /// Workspace-relative path of the contract file.
+    pub spec_path: String,
+    /// Normalized `Allowed changes` path patterns.
+    pub allowed: Vec<String>,
+}
+
+impl ContractTerritory {
+    pub fn new(spec_path: impl Into<String>, sections: &[crate::spec_core::Section]) -> Self {
+        Self {
+            spec_path: normalize_pattern(&spec_path.into()),
+            allowed: collect_path_boundaries(sections).0,
+        }
+    }
+
+    /// The contract file or where it was promoted from
+    /// (`<spec dir>/roadmap/<file name>`).
+    fn owns_file(&self, change: &str) -> bool {
+        if change == self.spec_path {
+            return true;
+        }
+        let (dir, name) = match self.spec_path.rsplit_once('/') {
+            Some((dir, name)) => (format!("{dir}/"), name),
+            None => (String::new(), self.spec_path.as_str()),
+        };
+        change == format!("{dir}roadmap/{name}")
+    }
+
+    fn allows(&self, change: &str) -> bool {
+        self.allowed
+            .iter()
+            .any(|pattern| path_matches_pattern(pattern, change))
+    }
+}
+
+/// How guard checks one contract's boundaries against a commit.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContractBoundaryPlan {
+    /// The commit touches the contract's territory, so its boundaries apply;
+    /// otherwise guard checks no boundary for it.
+    pub touched: bool,
+    /// Changes exempt from its `Allowed changes` check.
+    pub exempt: Vec<String>,
+}
+
+/// Plan guard's boundary check for every active contract (LEP-007 D6). A
+/// contract's `Forbidden` and `Allowed changes` apply only to a commit that
+/// touches its territory: a change matches its allow-list or is its contract
+/// file (or the file's `roadmap/` move source). Within such a commit, a
+/// change that belongs to another active contract (and not to this one) and
+/// the contract's own file are exempt from the allow-list; a change no
+/// contract claims is not, so it is out of bounds for every touched contract.
+/// `strict` keeps the pre-D6 behavior: every contract checks every change.
+/// `changes` are workspace-relative.
+pub fn plan_contract_boundaries(
+    contracts: &[ContractTerritory],
+    changes: &[String],
+    strict: bool,
+) -> Vec<ContractBoundaryPlan> {
+    contracts
+        .iter()
+        .enumerate()
+        .map(|(index, contract)| {
+            if strict {
+                return ContractBoundaryPlan {
+                    touched: true,
+                    exempt: Vec::new(),
+                };
+            }
+            let touched = changes
+                .iter()
+                .any(|change| contract.owns_file(change) || contract.allows(change));
+            let exempt = changes
+                .iter()
+                .filter(|change| {
+                    contract.owns_file(change)
+                        || (!contract.allows(change)
+                            && contracts.iter().enumerate().any(|(other, territory)| {
+                                other != index && territory.allows(change)
+                            }))
+                })
+                .cloned()
+                .collect();
+            ContractBoundaryPlan { touched, exempt }
+        })
+        .collect()
+}
+
+/// Normalize changed paths the way [`BoundariesVerifier`] does, relative to
+/// the workspace root found from `code_paths` (or the changes themselves).
+pub fn normalize_boundary_paths(code_paths: &[PathBuf], paths: &[PathBuf]) -> Vec<String> {
+    let workspace_root = find_workspace_root(code_paths).or_else(|| find_workspace_root(paths));
+    paths
+        .iter()
+        .map(|path| {
+            // Relative paths (for example a spec file under `specs/`) are
+            // resolved first, so they strip the canonical workspace root.
+            let absolute = if path.is_relative() {
+                path.canonicalize().unwrap_or_else(|_| path.clone())
+            } else {
+                path.clone()
+            };
+            let normalized = normalize_path(&absolute, workspace_root.as_deref());
+            if normalized.starts_with('/') {
+                normalize_path(path, workspace_root.as_deref())
+            } else {
+                normalized
+            }
+        })
+        .collect()
+}
 
 impl Verifier for BoundariesVerifier {
     fn name(&self) -> &str {
@@ -49,6 +176,16 @@ impl Verifier for BoundariesVerifier {
                     pattern: pattern.clone(),
                     matched: true,
                     locations: vec![change],
+                });
+                continue;
+            }
+
+            if self.exempt.iter().any(|exempt| exempt == &change) {
+                step_results.push(StepVerdict {
+                    step_text: change.clone(),
+                    verdict: Verdict::Pass,
+                    reason: "belongs to another active contract or is this contract's own file"
+                        .into(),
                 });
                 continue;
             }
@@ -280,7 +417,9 @@ mod tests {
 
     use crate::spec_core::{ResolvedSpec, Scenario, SpecLevel, SpecMeta, SpecResult, Verdict};
 
-    use super::{BoundariesVerifier, path_matches_pattern};
+    use super::{
+        BoundariesVerifier, ContractTerritory, path_matches_pattern, plan_contract_boundaries,
+    };
     use crate::spec_verify::{AiMode, VerificationContext, Verifier};
 
     fn make_resolved_spec(input: &str) -> SpecResult<ResolvedSpec> {
@@ -306,6 +445,174 @@ mod tests {
         ));
     }
 
+    const CONTRACT_A: &str = "spec: task\nname: \"A\"\n---\n\n## Boundaries\n\n### Allowed Changes\n- crates/ingest/**\n\n### Forbidden\n- knowledge/**\n";
+    const CONTRACT_B: &str =
+        "spec: task\nname: \"B\"\n---\n\n## Boundaries\n\n### Allowed Changes\n- crates/query/**\n";
+    const CONTRACT_C: &str = "spec: task\nname: \"C\"\n---\n\n## Boundaries\n\n### Allowed Changes\n- crates/server/**\n\n### Forbidden\n- knowledge/**\n";
+
+    /// Run guard's per-contract boundary check: plan every contract's
+    /// territory against `changes`, then verify each contract with the change
+    /// set and exemptions its plan assigns. Returns (spec path, results).
+    fn guard_boundaries(
+        contracts: &[(&str, &str)],
+        changes: &[&str],
+        strict: bool,
+    ) -> Vec<(String, Vec<crate::spec_core::ScenarioResult>)> {
+        let resolved = contracts
+            .iter()
+            .map(|(path, input)| (path.to_string(), make_resolved_spec(input).unwrap()))
+            .collect::<Vec<_>>();
+        let territories = resolved
+            .iter()
+            .map(|(path, spec)| ContractTerritory::new(path.clone(), &spec.task.sections))
+            .collect::<Vec<_>>();
+        let change_strings = changes.iter().map(|c| c.to_string()).collect::<Vec<_>>();
+        let plans = plan_contract_boundaries(&territories, &change_strings, strict);
+        resolved
+            .into_iter()
+            .zip(plans)
+            .map(|((path, spec), plan)| {
+                let change_paths = if plan.touched {
+                    changes.iter().map(PathBuf::from).collect()
+                } else {
+                    Vec::new()
+                };
+                let results = BoundariesVerifier::with_exempt(plan.exempt)
+                    .verify(&VerificationContext {
+                        code_paths: vec![PathBuf::from(".")],
+                        change_paths,
+                        ai_mode: AiMode::Off,
+                        resolved_spec: spec,
+                    })
+                    .unwrap();
+                (path, results)
+            })
+            .collect()
+    }
+
+    fn failures(results: &[crate::spec_core::ScenarioResult]) -> Vec<(String, String)> {
+        results
+            .iter()
+            .flat_map(|result| &result.step_results)
+            .filter(|step| step.verdict == Verdict::Fail)
+            .map(|step| (step.step_text.clone(), step.reason.clone()))
+            .collect()
+    }
+
+    fn two_contracts() -> [(&'static str, &'static str); 2] {
+        [
+            ("specs/task-a.spec.md", CONTRACT_A),
+            ("specs/task-b.spec.md", CONTRACT_B),
+        ]
+    }
+
+    #[test]
+    fn test_guard_boundaries_skip_contract_whose_territory_is_untouched() {
+        let out = guard_boundaries(&two_contracts(), &["crates/query/src/lib.rs"], false);
+        assert!(
+            out[0].1.is_empty(),
+            "contract A was not touched: {:?}",
+            out[0].1
+        );
+        assert_eq!(out[1].1.len(), 1);
+        assert_eq!(out[1].1[0].verdict, Verdict::Pass);
+    }
+
+    #[test]
+    fn test_guard_boundaries_forbidden_applies_to_touching_commit() {
+        let out = guard_boundaries(
+            &two_contracts(),
+            &["crates/ingest/src/lib.rs", "knowledge/x.md"],
+            false,
+        );
+        let a = failures(&out[0].1);
+        assert_eq!(a.len(), 1, "{a:?}");
+        assert_eq!(a[0].0, "knowledge/x.md");
+        assert!(a[0].1.contains("forbidden"), "{a:?}");
+    }
+
+    #[test]
+    fn test_guard_boundaries_other_contract_paths_are_not_out_of_bounds() {
+        let out = guard_boundaries(
+            &two_contracts(),
+            &["crates/ingest/src/lib.rs", "crates/query/src/lib.rs"],
+            false,
+        );
+        for (path, results) in &out {
+            assert!(
+                failures(results).is_empty(),
+                "{path}: {:?}",
+                failures(results)
+            );
+            assert_eq!(results[0].verdict, Verdict::Pass, "{path}");
+        }
+    }
+
+    #[test]
+    fn test_guard_boundaries_contract_file_and_move_source_are_in_bounds() {
+        let out = guard_boundaries(
+            &[("specs/task-c.spec.md", CONTRACT_C)],
+            &["specs/task-c.spec.md", "specs/roadmap/task-c.spec.md"],
+            false,
+        );
+        assert_eq!(out[0].1.len(), 1, "contract C's territory is touched");
+        assert!(failures(&out[0].1).is_empty(), "{:?}", failures(&out[0].1));
+        assert_eq!(out[0].1[0].verdict, Verdict::Pass);
+
+        // The contract file alone still counts as touching the territory, so
+        // its Forbidden list applies to the rest of the commit.
+        let out = guard_boundaries(
+            &[("specs/task-c.spec.md", CONTRACT_C)],
+            &["specs/task-c.spec.md", "knowledge/x.md"],
+            false,
+        );
+        let c = failures(&out[0].1);
+        assert_eq!(c.len(), 1, "{c:?}");
+        assert_eq!(c[0].0, "knowledge/x.md");
+    }
+
+    #[test]
+    fn test_guard_boundaries_unowned_path_fails_every_touched_contract() {
+        let out = guard_boundaries(
+            &two_contracts(),
+            &[
+                "crates/ingest/src/lib.rs",
+                "crates/query/src/lib.rs",
+                "docs/guide.md",
+            ],
+            false,
+        );
+        for (path, results) in &out {
+            let failed = failures(results);
+            assert_eq!(failed.len(), 1, "{path}: {failed:?}");
+            assert_eq!(failed[0].0, "docs/guide.md");
+            assert!(failed[0].1.contains("not covered by any allowed boundary"));
+        }
+    }
+
+    #[test]
+    fn test_guard_boundaries_commit_touching_no_territory_passes() {
+        for changes in [
+            vec!["docs/guide.md", ".gitlab-ci.yml"],
+            vec!["knowledge/requirements/req-x.md"],
+        ] {
+            let out = guard_boundaries(&two_contracts(), &changes, false);
+            for (path, results) in &out {
+                assert!(results.is_empty(), "{path} {changes:?}: {results:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_guard_boundaries_strict_mode_checks_every_contract() {
+        let out = guard_boundaries(&two_contracts(), &["docs/guide.md"], true);
+        for (path, results) in &out {
+            let failed = failures(results);
+            assert_eq!(failed.len(), 1, "{path}: {failed:?}");
+            assert!(failed[0].1.contains("not covered by any allowed boundary"));
+        }
+    }
+
     #[test]
     fn test_boundaries_verifier_accepts_changes_within_allowed_paths() {
         let resolved = make_resolved_spec(
@@ -324,7 +631,7 @@ name: "边界"
         )
         .unwrap();
 
-        let verifier = BoundariesVerifier;
+        let verifier = BoundariesVerifier::default();
         let results = verifier
             .verify(&VerificationContext {
                 code_paths: vec![PathBuf::from(".")],
@@ -353,7 +660,7 @@ name: "Docs"
         )
         .unwrap();
 
-        let verifier = BoundariesVerifier;
+        let verifier = BoundariesVerifier::default();
         let results = verifier
             .verify(&VerificationContext {
                 code_paths: vec![PathBuf::from(".")],
@@ -382,7 +689,7 @@ name: "边界"
         )
         .unwrap();
 
-        let verifier = BoundariesVerifier;
+        let verifier = BoundariesVerifier::default();
         let results = verifier
             .verify(&VerificationContext {
                 code_paths: vec![PathBuf::from(".")],
@@ -419,7 +726,7 @@ name: "边界"
         )
         .unwrap();
 
-        let verifier = BoundariesVerifier;
+        let verifier = BoundariesVerifier::default();
         let results = verifier
             .verify(&VerificationContext {
                 code_paths: vec![PathBuf::from(".")],
@@ -463,7 +770,7 @@ name: "边界"
             all_scenarios: Vec::new(),
         };
 
-        let verifier = BoundariesVerifier;
+        let verifier = BoundariesVerifier::default();
         let results = verifier
             .verify(&VerificationContext {
                 code_paths: vec![PathBuf::from(".")],

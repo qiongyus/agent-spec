@@ -263,6 +263,10 @@ enum Commands {
         /// Minimum quality score
         #[arg(long, default_value = "0.6")]
         min_score: f64,
+        /// Check every contract's boundaries against the whole change set,
+        /// even contracts whose territory the change does not touch
+        #[arg(long)]
+        strict_boundaries: bool,
     },
     /// Generate a human-readable contract review summary
     Explain {
@@ -1554,7 +1558,15 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             change,
             change_scope,
             min_score,
-        } => cmd_guard(&spec_dir, &code, &change, &change_scope, min_score),
+            strict_boundaries,
+        } => cmd_guard(
+            &spec_dir,
+            &code,
+            &change,
+            &change_scope,
+            min_score,
+            strict_boundaries,
+        ),
         Commands::Explain {
             spec,
             code,
@@ -1773,7 +1785,7 @@ fn cmd_verify(
     };
 
     let structural = crate::spec_verify::StructuralVerifier;
-    let boundaries = crate::spec_verify::BoundariesVerifier;
+    let boundaries = crate::spec_verify::BoundariesVerifier::default();
     let test = crate::spec_verify::TestVerifier::default().with_options(test_options);
     let ai = crate::spec_verify::AiVerifier::from_mode(ai_mode);
     let verifiers: Vec<&dyn crate::spec_verify::Verifier> =
@@ -1855,7 +1867,7 @@ fn build_matrix_for(
         resolved_spec: resolved.clone(),
     };
     let structural = crate::spec_verify::StructuralVerifier;
-    let boundaries = crate::spec_verify::BoundariesVerifier;
+    let boundaries = crate::spec_verify::BoundariesVerifier::default();
     let test = crate::spec_verify::TestVerifier::default();
     let ai = crate::spec_verify::AiVerifier::from_mode(mode);
     let verifiers: Vec<&dyn crate::spec_verify::Verifier> =
@@ -2846,6 +2858,7 @@ fn cmd_guard(
     change: &[PathBuf],
     change_scope: &str,
     min_score: f64,
+    strict_boundaries: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !spec_dir.exists() {
         // No specs directory → nothing to guard, pass silently
@@ -2878,17 +2891,49 @@ fn cmd_guard(
     // Each failed check, with the detail lines that say why (D8).
     let mut errors: Vec<(String, Vec<String>)> = Vec::new();
 
+    let mut contracts = Vec::new();
     for spec_file in &spec_files {
-        let gw = match crate::spec_gateway::SpecGateway::load(spec_file) {
-            Ok(gw) => gw,
+        match crate::spec_gateway::SpecGateway::load(spec_file) {
+            Ok(gw) => contracts.push((spec_file, gw)),
             Err(e) => {
                 errors.push((
                     format!("{}: parse error: {e}", spec_file.display()),
                     Vec::new(),
                 ));
-                continue;
             }
+        }
+    }
+
+    // D6: hold each contract to its own boundaries, against the changes that
+    // concern it, unless --strict-boundaries asks for the whole-commit check.
+    let code_paths = [code.to_path_buf()];
+    let normalized_changes =
+        crate::spec_verify::normalize_boundary_paths(&code_paths, &effective_changes);
+    let territories = contracts
+        .iter()
+        .map(|(spec_file, gw)| {
+            let spec_path = crate::spec_verify::normalize_boundary_paths(
+                &code_paths,
+                &[spec_file.to_path_buf()],
+            )
+            .pop()
+            .unwrap_or_default();
+            crate::spec_verify::ContractTerritory::new(spec_path, &gw.resolved().task.sections)
+        })
+        .collect::<Vec<_>>();
+    let plans = crate::spec_verify::plan_contract_boundaries(
+        &territories,
+        &normalized_changes,
+        strict_boundaries,
+    );
+
+    for ((spec_file, gw), plan) in contracts.into_iter().zip(plans) {
+        let contract_changes = if plan.touched {
+            effective_changes.clone()
+        } else {
+            Vec::new()
         };
+        let gw = gw.with_boundary_exemptions(plan.exempt);
 
         // Lint check
         if let Err(failure) = gw.quality_gate(min_score) {
@@ -2896,7 +2941,7 @@ fn cmd_guard(
         }
 
         // Verify check (only structural — fast enough for pre-commit)
-        match gw.verify_with_changes(code, &effective_changes) {
+        match gw.verify_with_changes(code, &contract_changes) {
             Ok(report) => {
                 if !gw.is_passing(&report) {
                     errors.push((

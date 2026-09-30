@@ -14,7 +14,9 @@ use crate::spec_core::{
 
 pub use ai_verifier::{AiBackend, AiVerifier, build_ai_request};
 pub use atlas_symbols::AtlasSymbolVerifier;
-pub use boundaries::BoundariesVerifier;
+pub use boundaries::{
+    BoundariesVerifier, ContractTerritory, normalize_boundary_paths, plan_contract_boundaries,
+};
 pub use complexity::ComplexityVerifier;
 pub use structural::StructuralVerifier;
 pub use test_verifier::{TestRunOptions, TestVerifier};

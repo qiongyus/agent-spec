@@ -20,6 +20,7 @@ pub struct SpecGateway {
     doc: crate::spec_core::SpecDocument,
     resolved: crate::spec_core::ResolvedSpec,
     test_options: TestRunOptions,
+    boundary_exempt: Vec<String>,
 }
 
 impl SpecGateway {
@@ -27,6 +28,14 @@ impl SpecGateway {
     /// scenarios are included).
     pub fn with_test_options(mut self, options: TestRunOptions) -> Self {
         self.test_options = options;
+        self
+    }
+
+    /// Workspace-relative changes exempt from this contract's `Allowed
+    /// changes` check (still held to `Forbidden`); guard sets them per
+    /// contract.
+    pub fn with_boundary_exemptions(mut self, exempt: Vec<String>) -> Self {
+        self.boundary_exempt = exempt;
         self
     }
 
@@ -38,6 +47,7 @@ impl SpecGateway {
             doc,
             resolved,
             test_options: TestRunOptions::default(),
+            boundary_exempt: Vec::new(),
         })
     }
 
@@ -49,6 +59,7 @@ impl SpecGateway {
             doc,
             resolved,
             test_options: TestRunOptions::default(),
+            boundary_exempt: Vec::new(),
         })
     }
 
@@ -226,7 +237,7 @@ impl SpecGateway {
         };
 
         let structural = StructuralVerifier;
-        let boundaries = BoundariesVerifier;
+        let boundaries = BoundariesVerifier::with_exempt(self.boundary_exempt.clone());
         let atlas_symbols = AtlasSymbolVerifier;
         let test = TestVerifier::default().with_options(self.test_options);
         let complexity = ComplexityVerifier;

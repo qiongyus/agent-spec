@@ -69,6 +69,16 @@ All notable changes to `agent-spec` are documented here. Format follows
   `uncertain`. **Upgrade note:** a spec that was green only because its test
   is `#[ignore]`d turns red; give it a real test or, for a long-running
   scenario, `Mode: soak`.
+- Guard holds each contract to its own boundaries (LEP-007 → ADR-006 →
+  REQ-GUARD-CONTRACT-BOUNDARIES): a contract's `Forbidden` and `Allowed
+  changes` apply only to a commit that touches its territory (a change matches
+  its allow-list, or is its contract file or that file's `roadmap/` move
+  source). A change that belongs to another active contract is not out of
+  bounds; a change no contract claims is out of bounds for every touched
+  contract; a commit that touches no contract (documentation, CI, a
+  `knowledge/` governance commit) is not boundary-checked. `guard
+  --strict-boundaries` keeps the previous whole-commit check. Workspaces that
+  ran `guard --change-scope none` to get commits through can drop the flag.
 - Supersession dependency resolution (LEP-007 → ADR-006 →
   REQ-SUPERSESSION-DEPENDENCY-RESOLUTION): a `## Dependencies` entry naming a
   superseded block resolves forward along `supersedes:` to the block that is

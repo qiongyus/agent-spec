@@ -34,9 +34,28 @@ All notable changes to `agent-spec` are documented here. Format follows
   `Features:` value passes no flag and raises the spec lint warning
   `selector-features-empty`. Selectors without the field run exactly as
   before.
+- Guard explains non-passing verdicts (LEP-007 → ADR-006 →
+  REQ-HONEST-TEST-VERDICTS): below each failing spec, guard prints every
+  `fail` / `uncertain` scenario with its selector, exit code or signal and the
+  last 40 lines of test output (or the failing steps when no test ran). An
+  `uncertain` verdict names its class: `compile-error` (cargo reported a
+  compile error; retrying will not help) or `runner-exited` (the runner
+  exited without cargo output; usually environmental). Test evidence records
+  `exit_code`, `signal`, `ignored` and `failure_class`. agent-spec does not
+  retry test runs.
 
 ### Changed
 
+- A scenario whose bound test did not run is never a pass (REQ-HONEST-TEST-VERDICTS):
+  the test verifier counts executed tests from libtest's `test result:`
+  summary lines (passed + failed) instead of `running N tests`, which libtest
+  also prints for a filter matching only an `#[ignore]`d test. A scenario
+  whose matched tests are all ignored is now `skip` ("bound test is
+  #[ignore]d") instead of `pass`; with some ignored, the verdict comes from
+  the executed tests. A successful run with no `test result:` line is
+  `uncertain`. **Upgrade note:** a spec that was green only because its test
+  is `#[ignore]`d turns red; give it a real test or, for a long-running
+  scenario, `Mode: soak`.
 - Supersession dependency resolution (LEP-007 → ADR-006 →
   REQ-SUPERSESSION-DEPENDENCY-RESOLUTION): a `## Dependencies` entry naming a
   superseded block resolves forward along `supersedes:` to the block that is

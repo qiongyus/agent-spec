@@ -1762,7 +1762,7 @@ fn cmd_verify(
 
     let structural = crate::spec_verify::StructuralVerifier;
     let boundaries = crate::spec_verify::BoundariesVerifier;
-    let test = crate::spec_verify::TestVerifier;
+    let test = crate::spec_verify::TestVerifier::default();
     let ai = crate::spec_verify::AiVerifier::from_mode(ai_mode);
     let verifiers: Vec<&dyn crate::spec_verify::Verifier> =
         vec![&structural, &boundaries, &test, &ai];
@@ -1844,7 +1844,7 @@ fn build_matrix_for(
     };
     let structural = crate::spec_verify::StructuralVerifier;
     let boundaries = crate::spec_verify::BoundariesVerifier;
-    let test = crate::spec_verify::TestVerifier;
+    let test = crate::spec_verify::TestVerifier::default();
     let ai = crate::spec_verify::AiVerifier::from_mode(mode);
     let verifiers: Vec<&dyn crate::spec_verify::Verifier> =
         vec![&structural, &boundaries, &test, &ai];
@@ -2851,35 +2851,45 @@ fn cmd_guard(
         );
     }
 
-    let mut errors = Vec::new();
+    // Each failed check, with the detail lines that say why (D8).
+    let mut errors: Vec<(String, Vec<String>)> = Vec::new();
 
     for spec_file in &spec_files {
         let gw = match crate::spec_gateway::SpecGateway::load(spec_file) {
             Ok(gw) => gw,
             Err(e) => {
-                errors.push(format!("{}: parse error: {e}", spec_file.display()));
+                errors.push((
+                    format!("{}: parse error: {e}", spec_file.display()),
+                    Vec::new(),
+                ));
                 continue;
             }
         };
 
         // Lint check
         if let Err(failure) = gw.quality_gate(min_score) {
-            errors.push(format!("{}: {}", spec_file.display(), failure,));
+            errors.push((format!("{}: {}", spec_file.display(), failure), Vec::new()));
         }
 
         // Verify check (only structural — fast enough for pre-commit)
         match gw.verify_with_changes(code, &effective_changes) {
             Ok(report) => {
                 if !gw.is_passing(&report) {
-                    errors.push(format!(
-                        "{}: {}",
-                        spec_file.display(),
-                        format_non_passing_summary(&report.summary)
+                    errors.push((
+                        format!(
+                            "{}: {}",
+                            spec_file.display(),
+                            format_non_passing_summary(&report.summary)
+                        ),
+                        guard_detail_lines(&report),
                     ));
                 }
             }
             Err(e) => {
-                errors.push(format!("{}: verify error: {e}", spec_file.display()));
+                errors.push((
+                    format!("{}: verify error: {e}", spec_file.display()),
+                    Vec::new(),
+                ));
             }
         }
     }
@@ -2889,11 +2899,72 @@ fn cmd_guard(
         Ok(())
     } else {
         eprintln!("agent-spec guard: FAILED");
-        for err in &errors {
+        for (err, detail) in &errors {
             eprintln!("  - {err}");
+            for line in detail {
+                eprintln!("      {line}");
+            }
         }
         Err(format!("{} check(s) failed", errors.len()).into())
     }
+}
+
+/// Lines of test output guard shows for each non-passing scenario.
+const GUARD_OUTPUT_TAIL_LINES: usize = 40;
+
+/// Why each `fail` / `uncertain` scenario in `report` is not a pass: its name,
+/// selector, exit status, failure class and the tail of its test output, or
+/// the failing steps when no test ran (for example a boundary check). Passing
+/// scenarios contribute nothing, so a green run prints no test output.
+fn guard_detail_lines(report: &crate::spec_core::VerificationReport) -> Vec<String> {
+    use crate::spec_core::{Evidence, Verdict};
+
+    let mut lines = Vec::new();
+    for result in &report.results {
+        if !matches!(result.verdict, Verdict::Fail | Verdict::Uncertain) {
+            continue;
+        }
+        let test_output = result.evidence.iter().find_map(|evidence| match evidence {
+            Evidence::TestOutput {
+                test_name,
+                stdout,
+                detail,
+                ..
+            } => Some((test_name, stdout, detail)),
+            _ => None,
+        });
+        let verdict = match result.verdict {
+            Verdict::Fail => "fail".to_string(),
+            _ => match test_output.and_then(|(_, _, detail)| detail.failure_class.as_deref()) {
+                Some(class) => format!("uncertain ({class})"),
+                None => "uncertain".to_string(),
+            },
+        };
+        lines.push(format!("{verdict}: {}", result.scenario_name));
+        match test_output {
+            Some((test_name, stdout, detail)) => {
+                let status = match (detail.exit_code, detail.signal) {
+                    (Some(code), _) => format!("exit code {code}"),
+                    (None, Some(signal)) => format!("signal {signal}"),
+                    (None, None) => "exit status unknown".to_string(),
+                };
+                lines.push(format!("  selector: {test_name}  ({status})"));
+                let output = stdout.lines().collect::<Vec<_>>();
+                let tail = &output[output.len().saturating_sub(GUARD_OUTPUT_TAIL_LINES)..];
+                lines.extend(tail.iter().map(|line| format!("  | {line}")));
+            }
+            None => {
+                for step in result
+                    .step_results
+                    .iter()
+                    .filter(|step| step.verdict != Verdict::Pass)
+                {
+                    lines.push(format!("  {}: {}", step.step_text, step.reason));
+                }
+            }
+        }
+    }
+    lines
 }
 
 fn resolve_command_change_paths(
@@ -8527,6 +8598,100 @@ name: "退款"
         );
         assert!(specs.is_dir(), "the fixture's real specs root still exists");
         let _ = fs::remove_dir_all(dir);
+    }
+
+    fn guard_test_result(
+        name: &str,
+        verdict: crate::spec_core::Verdict,
+        stdout: String,
+        exit_code: i32,
+        failure_class: Option<&str>,
+    ) -> crate::spec_core::ScenarioResult {
+        crate::spec_core::ScenarioResult {
+            scenario_name: name.into(),
+            verdict,
+            step_results: Vec::new(),
+            evidence: vec![crate::spec_core::Evidence::TestOutput {
+                test_name: format!("probe::{name}"),
+                stdout,
+                passed: verdict == crate::spec_core::Verdict::Pass,
+                package: Some("probe".into()),
+                level: None,
+                test_double: None,
+                targets: None,
+                detail: crate::spec_core::TestOutputDetail {
+                    exit_code: Some(exit_code),
+                    failure_class: failure_class.map(str::to_string),
+                    ..Default::default()
+                },
+            }],
+            duration_ms: 1,
+            provenance: None,
+        }
+    }
+
+    #[test]
+    fn test_guard_detail_lines_for_non_passing_scenarios() {
+        let mut output = (1..=44)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>();
+        output.push("thread 'probe' panicked at src/lib.rs:3:5: boom".into());
+        let report = crate::spec_core::VerificationReport::from_results(
+            "Probe".into(),
+            vec![
+                guard_test_result(
+                    "failing case",
+                    crate::spec_core::Verdict::Fail,
+                    output.join("\n"),
+                    101,
+                    None,
+                ),
+                guard_test_result(
+                    "passing case",
+                    crate::spec_core::Verdict::Pass,
+                    "passing output".into(),
+                    0,
+                    None,
+                ),
+            ],
+        );
+        let detail = super::guard_detail_lines(&report).join("\n");
+        assert!(detail.contains("failing case"), "{detail}");
+        assert!(detail.contains("probe::failing case"), "{detail}");
+        assert!(detail.contains("exit code 101"), "{detail}");
+        assert!(
+            detail.contains("panicked at src/lib.rs:3:5: boom"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("line 6"),
+            "the last 40 lines start at line 6"
+        );
+        assert!(!detail.contains("line 5\n"), "{detail}");
+        assert!(
+            !detail
+                .lines()
+                .any(|line| line.trim_end().ends_with("line 5"))
+        );
+        assert!(!detail.contains("passing case"), "{detail}");
+        assert!(!detail.contains("passing output"), "{detail}");
+    }
+
+    #[test]
+    fn test_guard_detail_lines_name_uncertain_class() {
+        let report = crate::spec_core::VerificationReport::from_results(
+            "Probe".into(),
+            vec![guard_test_result(
+                "broken build",
+                crate::spec_core::Verdict::Uncertain,
+                "error[E0425]: cannot find value `x`".into(),
+                101,
+                Some("compile-error"),
+            )],
+        );
+        let detail = super::guard_detail_lines(&report).join("\n");
+        assert!(detail.contains("broken build"), "{detail}");
+        assert!(detail.contains("compile-error"), "{detail}");
     }
 
     const STAGED_A_SPEC: &str = "spec: task\nname: \"A\"\nsatisfies: [REQ-A]\n---\n## Intent\nA.\n## Completion Criteria\nScenario: A\n  Test: test_a\n  Given A\n  When A\n  Then A\n";

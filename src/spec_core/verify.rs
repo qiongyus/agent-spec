@@ -93,6 +93,18 @@ pub struct TestOutputDetail {
     /// Cargo features the selector requested (`Features:` / `特性:`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub features: Option<String>,
+    /// Exit code of the test command, when it exited normally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Signal that terminated the test command, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<i32>,
+    /// Matched tests libtest reported as ignored (never run); omitted when 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignored: Option<usize>,
+    /// Why no test ran: `compile-error` or `runner-exited`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<String>,
 }
 
 /// Evidence supporting a verification verdict.

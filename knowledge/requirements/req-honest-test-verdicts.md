@@ -151,14 +151,14 @@ Rule: REQ-HONEST-TEST-VERDICTS-GUARD-DETAIL
 Scenario: guard 打印失败场景的细节
   Given 一个 spec 含一个绑定失败测试的场景
   When 运行 guard
-  Then stdout 在该 spec 汇总行之后包含该场景名、selector、`exit code 101` 与测试输出中的 panic 消息
+  Then stderr 在该 spec 汇总行之后包含该场景名、selector、`exit code 101` 与测试输出中的 panic 消息
 
 Rule: REQ-HONEST-TEST-VERDICTS-GUARD-CLASS
 
 Scenario: guard 打印 uncertain 类别
   Given 一个 spec 含一个绑定测试所在 crate 无法编译的场景
   When 运行 guard
-  Then stdout 包含该场景名与 `compile-error`
+  Then stderr 包含该场景名与 `compile-error`
 
 Rule: REQ-HONEST-TEST-VERDICTS-NO-RETRY
 
@@ -172,7 +172,7 @@ Rule: REQ-HONEST-TEST-VERDICTS-PASS-QUIET
 Scenario: 通过的场景不打印测试输出
   Given 一个 spec 的全部场景都通过
   When 运行 guard
-  Then stdout 不包含任何测试输出行
+  Then stderr 不包含任何测试输出行
 
 ## Dependencies
 

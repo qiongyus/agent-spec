@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::spec_core::{
@@ -11,7 +12,81 @@ use crate::spec_core::{
 
 use super::{VerificationContext, Verifier};
 
-pub struct TestVerifier;
+/// Runs each bound scenario's `cargo test` and judges the verdict from what
+/// libtest reports. The runner is injectable so the judgment can be tested
+/// without spawning cargo; production uses [`CargoRunner`].
+pub struct TestVerifier {
+    runner: Arc<dyn TestCommandRunner>,
+}
+
+impl Default for TestVerifier {
+    fn default() -> Self {
+        Self::with_runner(Arc::new(CargoRunner))
+    }
+}
+
+impl TestVerifier {
+    pub fn with_runner(runner: Arc<dyn TestCommandRunner>) -> Self {
+        Self { runner }
+    }
+}
+
+/// How a test command ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TestExit {
+    pub success: bool,
+    /// Exit code when the process exited normally.
+    pub code: Option<i32>,
+    /// Signal number when the process was terminated by a signal.
+    pub signal: Option<i32>,
+}
+
+/// Captured result of one test command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestRun {
+    pub exit: TestExit,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// Spawns a test command. agent-spec never retries a run: a flaky runner is
+/// reported (as `runner-exited`), and retrying is the caller's decision.
+pub trait TestCommandRunner: Send + Sync {
+    fn run(&self, args: &[String], cwd: &Path) -> SpecResult<TestRun>;
+}
+
+/// The production runner: `cargo <args>` in the workspace root.
+pub struct CargoRunner;
+
+impl TestCommandRunner for CargoRunner {
+    fn run(&self, args: &[String], cwd: &Path) -> SpecResult<TestRun> {
+        let output = Command::new("cargo")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .map_err(|err| SpecError::Verification(format!("failed to run cargo test: {err}")))?;
+        Ok(TestRun {
+            exit: TestExit {
+                success: output.status.success(),
+                code: output.status.code(),
+                signal: exit_signal(&output.status),
+            },
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+}
+
+#[cfg(unix)]
+fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
+    None
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BindingSource {
@@ -44,77 +119,31 @@ impl Verifier for TestVerifier {
             };
 
             let started = Instant::now();
-            let command_args = build_cargo_test_args(&binding.selector);
-            let output = Command::new("cargo")
-                .args(&command_args)
-                .current_dir(&workspace_root)
-                .output()
-                .map_err(|err| {
-                    SpecError::Verification(format!("failed to run cargo test: {err}"))
-                })?;
+            let run = self
+                .runner
+                .run(&build_cargo_test_args(&binding.selector), &workspace_root)?;
             let duration_ms = started.elapsed().as_millis() as u64;
 
-            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-            let combined = if stderr.trim().is_empty() {
-                stdout.clone()
-            } else if stdout.trim().is_empty() {
-                stderr.clone()
-            } else {
-                format!("{stdout}\n{stderr}")
-            };
-            let executed_tests = cargo_test_executed_count(&combined);
-
-            let verdict =
-                test_run_verdict(output.status.success(), executed_tests, scenario.review);
-            let selector_label = binding.selector.label();
-            let reason = if output.status.success() && executed_tests == 0 {
-                format!("test selector `{selector_label}` matched zero tests")
-            } else if output.status.success() {
-                match binding.source {
-                    BindingSource::ExplicitScenarioSelector => {
-                        format!("covered by explicit test `{selector_label}`")
-                    }
-                    BindingSource::LegacyComment => {
-                        format!("covered by legacy @spec test `{selector_label}`")
-                    }
-                }
-            } else if executed_tests == 0 {
-                // cargo exited non-zero before any test ran → build/toolchain
-                // failure, not a disproven claim (verdict is Uncertain).
-                format!(
-                    "could not run `{selector_label}`: cargo exited before any test ran \
-                     (build/toolchain failure)"
-                )
-            } else {
-                match binding.source {
-                    BindingSource::ExplicitScenarioSelector => {
-                        format!("explicit test `{selector_label}` failed")
-                    }
-                    BindingSource::LegacyComment => {
-                        format!("legacy @spec test `{selector_label}` failed")
-                    }
-                }
-            };
-
-            let step_results = scenario
-                .steps
-                .iter()
-                .map(|step| StepVerdict {
-                    step_text: step.text.clone(),
-                    verdict,
-                    reason: reason.clone(),
-                })
-                .collect();
-
+            let combined = combine_output(&run.stdout, &run.stderr);
+            let judgment = judge_test_run(&run.exit, &combined, scenario.review);
+            let reason = judgment_reason(&judgment, &binding.selector.label(), binding.source);
             results.push(ScenarioResult {
                 scenario_name: scenario.name.clone(),
-                verdict,
-                step_results,
+                verdict: judgment.verdict,
+                step_results: scenario
+                    .steps
+                    .iter()
+                    .map(|step| StepVerdict {
+                        step_text: step.text.clone(),
+                        verdict: judgment.verdict,
+                        reason: reason.clone(),
+                    })
+                    .collect(),
                 evidence: vec![test_output_evidence(
                     &binding.selector,
                     combined,
-                    output.status.success() && executed_tests > 0,
+                    &run.exit,
+                    &judgment,
                 )],
                 duration_ms,
                 provenance: None,
@@ -122,6 +151,16 @@ impl Verifier for TestVerifier {
         }
 
         Ok(results)
+    }
+}
+
+fn combine_output(stdout: &str, stderr: &str) -> String {
+    if stderr.trim().is_empty() {
+        stdout.to_string()
+    } else if stdout.trim().is_empty() {
+        stderr.to_string()
+    } else {
+        format!("{stdout}\n{stderr}")
     }
 }
 
@@ -213,50 +252,183 @@ fn selector_features(selector: &TestSelector) -> Option<&str> {
         .filter(|features| !features.is_empty())
 }
 
-fn test_output_evidence(selector: &TestSelector, stdout: String, passed: bool) -> Evidence {
+fn test_output_evidence(
+    selector: &TestSelector,
+    stdout: String,
+    exit: &TestExit,
+    judgment: &TestJudgment,
+) -> Evidence {
     Evidence::TestOutput {
         test_name: selector.label(),
         stdout,
-        passed,
+        passed: exit.success && judgment.executed() > 0,
         package: selector.package.clone(),
         level: selector.level.clone(),
         test_double: selector.test_double.clone(),
         targets: selector.targets.clone(),
         detail: TestOutputDetail {
             features: selector_features(selector).map(str::to_string),
+            exit_code: exit.code,
+            signal: exit.signal,
+            ignored: judgment
+                .summary
+                .map(|summary| summary.ignored)
+                .filter(|ignored| *ignored > 0),
+            failure_class: judgment.failure_class.map(str::to_string),
         },
     }
 }
 
-fn cargo_test_executed_count(output: &str) -> usize {
-    output
-        .lines()
-        .filter_map(|line| {
-            let count = line
-                .trim()
-                .strip_prefix("running ")?
-                .split_whitespace()
-                .next()?;
-            count.parse::<usize>().ok()
-        })
-        .sum()
+/// Totals of every libtest `test result:` line in a cargo run (one line per
+/// test binary).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LibtestSummary {
+    passed: usize,
+    failed: usize,
+    ignored: usize,
 }
 
-fn test_run_verdict(success: bool, executed_tests: usize, review: ReviewMode) -> Verdict {
-    match (success, executed_tests) {
-        // A test built, ran, and failed → a genuinely disproven claim.
-        (false, n) if n > 0 => Verdict::Fail,
-        // Non-success with zero tests executed means cargo never reached a test
-        // — a build/toolchain failure, not a disproven claim. Report Uncertain
-        // so a project that merely fails to build (e.g. a book chapter spec whose
-        // analyzed project doesn't compile in the reviewer's environment) cannot
-        // masquerade as a failed scenario.
-        (false, _) => Verdict::Uncertain,
-        // Built cleanly but the selector matched no tests.
-        (true, 0) => Verdict::Skip,
+impl LibtestSummary {
+    /// Tests that actually ran. An ignored test is matched but never run.
+    fn executed(&self) -> usize {
+        self.passed + self.failed
+    }
+}
+
+/// Sum the `test result:` summary lines; `None` when there is none. libtest
+/// prints `running 1 test` for a filter that matches only an `#[ignore]`d
+/// test, so the `running` lines cannot tell executed from ignored.
+fn parse_libtest_summary(output: &str) -> Option<LibtestSummary> {
+    let mut total: Option<LibtestSummary> = None;
+    for line in output.lines() {
+        let Some(rest) = line.trim().strip_prefix("test result:") else {
+            continue;
+        };
+        let entry = total.get_or_insert_with(LibtestSummary::default);
+        for part in rest.split([';', '.']) {
+            let mut words = part.split_whitespace();
+            let (Some(count), Some(label)) = (words.next(), words.next()) else {
+                continue;
+            };
+            let Ok(count) = count.parse::<usize>() else {
+                continue;
+            };
+            match label {
+                "passed" => entry.passed += count,
+                "failed" => entry.failed += count,
+                "ignored" => entry.ignored += count,
+                _ => {}
+            }
+        }
+    }
+    total
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JudgmentKind {
+    /// Matched tests ran and all passed.
+    Covered,
+    /// At least one matched test ran and failed.
+    Failed,
+    /// Every matched test is `#[ignore]`d, so none ran.
+    AllIgnored,
+    /// The selector matched no test.
+    ZeroMatched,
+    /// cargo succeeded but printed no `test result:` line.
+    NoSummary,
+    /// cargo exited non-zero before any test ran.
+    NotRun,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TestJudgment {
+    verdict: Verdict,
+    kind: JudgmentKind,
+    summary: Option<LibtestSummary>,
+    /// `compile-error` or `runner-exited` for a run that never reached a test.
+    failure_class: Option<&'static str>,
+}
+
+impl TestJudgment {
+    fn executed(&self) -> usize {
+        self.summary.map_or(0, |summary| summary.executed())
+    }
+}
+
+/// Judge a cargo test run from its exit and libtest's summary. A scenario
+/// passes only when at least one matched test executed; a missing or
+/// malformed summary is `uncertain`, never `pass`.
+fn judge_test_run(exit: &TestExit, output: &str, review: ReviewMode) -> TestJudgment {
+    let summary = parse_libtest_summary(output);
+    let executed = summary.map_or(0, |summary| summary.executed());
+    let ignored = summary.map_or(0, |summary| summary.ignored);
+    let judgment = |verdict, kind, failure_class| TestJudgment {
+        verdict,
+        kind,
+        summary,
+        failure_class,
+    };
+    if !exit.success {
+        return if executed > 0 {
+            // A test built, ran, and failed → a genuinely disproven claim.
+            judgment(Verdict::Fail, JudgmentKind::Failed, None)
+        } else {
+            // cargo never reached a test: a build, toolchain, or runner
+            // failure, not a disproven claim.
+            judgment(
+                Verdict::Uncertain,
+                JudgmentKind::NotRun,
+                Some(not_run_class(output)),
+            )
+        };
+    }
+    match (summary, executed, ignored) {
+        (None, _, _) => judgment(Verdict::Uncertain, JudgmentKind::NoSummary, None),
+        (Some(_), 0, 0) => judgment(Verdict::Skip, JudgmentKind::ZeroMatched, None),
+        (Some(_), 0, _) => judgment(Verdict::Skip, JudgmentKind::AllIgnored, None),
         // Human/AI-reviewed scenarios are judged out of band.
-        (true, _) if review == ReviewMode::Human => Verdict::PendingReview,
-        (true, _) => Verdict::Pass,
+        _ if review == ReviewMode::Human => {
+            judgment(Verdict::PendingReview, JudgmentKind::Covered, None)
+        }
+        _ => judgment(Verdict::Pass, JudgmentKind::Covered, None),
+    }
+}
+
+/// A compile error never deserves a retry; a runner that exited without
+/// cargo output usually is an environment problem worth one.
+fn not_run_class(output: &str) -> &'static str {
+    let compile_error = output.lines().any(|line| {
+        let line = line.trim_start();
+        line.starts_with("error[E") || line.contains("could not compile")
+    });
+    if compile_error {
+        "compile-error"
+    } else {
+        "runner-exited"
+    }
+}
+
+fn judgment_reason(judgment: &TestJudgment, selector_label: &str, source: BindingSource) -> String {
+    let binding = match source {
+        BindingSource::ExplicitScenarioSelector => "explicit test",
+        BindingSource::LegacyComment => "legacy @spec test",
+    };
+    match judgment.kind {
+        JudgmentKind::Covered => format!("covered by {binding} `{selector_label}`"),
+        JudgmentKind::Failed => format!("{binding} `{selector_label}` failed"),
+        JudgmentKind::AllIgnored => format!(
+            "test selector `{selector_label}` matched only ignored tests: bound test is #[ignore]d"
+        ),
+        JudgmentKind::ZeroMatched => {
+            format!("test selector `{selector_label}` matched zero tests")
+        }
+        JudgmentKind::NoSummary => format!(
+            "could not judge `{selector_label}`: cargo printed no libtest `test result:` summary"
+        ),
+        JudgmentKind::NotRun => format!(
+            "could not run `{selector_label}`: cargo exited before any test ran ({})",
+            judgment.failure_class.unwrap_or("runner-exited")
+        ),
     }
 }
 
@@ -344,9 +516,11 @@ mod tests {
     use crate::spec_core::{ReviewMode, Scenario, Span, TestSelector, Verdict};
 
     use super::{
-        BindingSource, build_cargo_test_args, cargo_test_executed_count, extract_bindings,
-        resolve_test_binding, test_output_evidence, test_run_verdict,
+        BindingSource, TestCommandRunner, TestExit, TestRun, TestVerifier, build_cargo_test_args,
+        extract_bindings, judge_test_run, judgment_reason, parse_libtest_summary,
+        resolve_test_binding, test_output_evidence,
     };
+    use crate::spec_verify::Verifier;
 
     fn selector(package: Option<&str>, features: Option<&str>) -> TestSelector {
         TestSelector {
@@ -405,46 +579,196 @@ mod tests {
 
     #[test]
     fn test_test_output_evidence_records_selector_features() {
-        let with = test_output_evidence(&selector(None, Some("probe")), String::new(), true);
+        let ok = exit(0);
+        let judgment = judge_test_run(
+            &ok,
+            &format!("running 1 test\n.\n{}\n", summary_line(1, 0, 0)),
+            ReviewMode::Auto,
+        );
+        let with = test_output_evidence(
+            &selector(None, Some("probe")),
+            String::new(),
+            &ok,
+            &judgment,
+        );
         let json = serde_json::to_value(&with).unwrap();
         assert_eq!(json["features"], "probe");
 
-        let without = test_output_evidence(&selector(None, None), String::new(), true);
+        let without = test_output_evidence(&selector(None, None), String::new(), &ok, &judgment);
         let json = serde_json::to_value(&without).unwrap();
         assert!(json.get("features").is_none());
     }
 
+    fn exit(code: i32) -> TestExit {
+        TestExit {
+            success: code == 0,
+            code: Some(code),
+            signal: None,
+        }
+    }
+
+    fn summary_line(passed: usize, failed: usize, ignored: usize) -> String {
+        let status = if failed > 0 { "FAILED" } else { "ok" };
+        format!(
+            "test result: {status}. {passed} passed; {failed} failed; {ignored} ignored; 0 measured; 3 filtered out; finished in 0.00s"
+        )
+    }
+
     #[test]
-    fn test_cargo_test_executed_count_distinguishes_zero_match_from_mixed_targets() {
-        assert_eq!(
-            cargo_test_executed_count(
-                "running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 10 filtered out"
-            ),
-            0
+    fn test_parse_libtest_summary_sums_binaries_and_separates_ignored() {
+        let output = format!(
+            "running 3 tests\n..i\n{}\n\nrunning 1 test\n.\n{}\n",
+            summary_line(2, 0, 1),
+            summary_line(1, 0, 0)
         );
-        assert_eq!(
-            cargo_test_executed_count(
-                "running 1 test\n.\ntest result: ok\n\nrunning 0 tests\ntest result: ok"
-            ),
-            1
+        let summary = parse_libtest_summary(&output).unwrap();
+        assert_eq!(summary.passed, 3);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.ignored, 1);
+        assert_eq!(summary.executed(), 3);
+        assert_eq!(parse_libtest_summary("running 1 test\n.\n"), None);
+    }
+
+    #[test]
+    fn test_verdict_is_skip_when_every_matched_test_is_ignored() {
+        let output = format!("running 1 test\ni\n{}\n", summary_line(0, 0, 1));
+        let judgment = judge_test_run(&exit(0), &output, ReviewMode::Auto);
+        assert_eq!(judgment.verdict, Verdict::Skip);
+        let reason = judgment_reason(
+            &judgment,
+            "tests::probe",
+            BindingSource::ExplicitScenarioSelector,
+        );
+        assert!(reason.contains("bound test is #[ignore]d"), "{reason}");
+        // Zero matches without ignored tests keeps the existing reason.
+        let none = judge_test_run(
+            &exit(0),
+            &format!("running 0 tests\n{}\n", summary_line(0, 0, 0)),
+            ReviewMode::Auto,
+        );
+        assert_eq!(none.verdict, Verdict::Skip);
+        assert!(
+            judgment_reason(&none, "x", BindingSource::ExplicitScenarioSelector)
+                .contains("matched zero tests")
         );
     }
 
     #[test]
-    fn test_run_verdict_distinguishes_build_from_test_failure() {
-        assert_eq!(test_run_verdict(true, 0, ReviewMode::Auto), Verdict::Skip);
-        assert_eq!(test_run_verdict(true, 1, ReviewMode::Auto), Verdict::Pass);
-        assert_eq!(
-            test_run_verdict(true, 1, ReviewMode::Human),
-            Verdict::PendingReview
+    fn test_verdict_never_passes_or_pends_with_zero_executed() {
+        let output = format!("running 1 test\ni\n{}\n", summary_line(0, 0, 1));
+        let judgment = judge_test_run(&exit(0), &output, ReviewMode::Human);
+        assert_eq!(judgment.verdict, Verdict::Skip);
+        let passing = judge_test_run(
+            &exit(0),
+            &format!("running 1 test\n.\n{}\n", summary_line(1, 0, 0)),
+            ReviewMode::Human,
         );
-        // Built, ran, and failed → a real failure.
-        assert_eq!(test_run_verdict(false, 2, ReviewMode::Auto), Verdict::Fail);
-        // cargo failed before any test ran (build failure) → Uncertain, not Fail.
-        assert_eq!(
-            test_run_verdict(false, 0, ReviewMode::Auto),
-            Verdict::Uncertain
-        );
+        assert_eq!(passing.verdict, Verdict::PendingReview);
+    }
+
+    #[test]
+    fn test_verdict_uses_executed_tests_when_some_are_ignored() {
+        let selector = TestSelector::filter_only("probe");
+        let passed_output = format!("running 2 tests\n.i\n{}\n", summary_line(1, 0, 1));
+        let passed = judge_test_run(&exit(0), &passed_output, ReviewMode::Auto);
+        assert_eq!(passed.verdict, Verdict::Pass);
+        let failed_output = format!("running 2 tests\nFi\n{}\n", summary_line(0, 1, 1));
+        let failed = judge_test_run(&exit(101), &failed_output, ReviewMode::Auto);
+        assert_eq!(failed.verdict, Verdict::Fail);
+        for (judgment, run_exit, output) in [
+            (&passed, exit(0), passed_output.clone()),
+            (&failed, exit(101), failed_output.clone()),
+        ] {
+            let evidence = test_output_evidence(&selector, output, &run_exit, judgment);
+            let json = serde_json::to_value(&evidence).unwrap();
+            assert_eq!(json["ignored"], 1);
+        }
+    }
+
+    #[test]
+    fn test_verdict_is_uncertain_without_summary_line() {
+        let judgment = judge_test_run(&exit(0), "running 1 test\n.\n", ReviewMode::Auto);
+        assert_eq!(judgment.verdict, Verdict::Uncertain);
+    }
+
+    #[test]
+    fn test_uncertain_distinguishes_compile_error_from_runner_exit() {
+        let selector = TestSelector::filter_only("probe");
+        let compile_output = "error[E0425]: cannot find value `x` in this scope\nerror: could not compile `probe` (lib test) due to 1 previous error\n";
+        let compile = judge_test_run(&exit(101), compile_output, ReviewMode::Auto);
+        assert_eq!(compile.verdict, Verdict::Uncertain);
+        assert_eq!(compile.failure_class, Some("compile-error"));
+
+        let runner = judge_test_run(&exit(255), "", ReviewMode::Auto);
+        assert_eq!(runner.verdict, Verdict::Uncertain);
+        assert_eq!(runner.failure_class, Some("runner-exited"));
+        let evidence = test_output_evidence(&selector, String::new(), &exit(255), &runner);
+        let json = serde_json::to_value(&evidence).unwrap();
+        assert_eq!(json["exit_code"], 255);
+        assert_eq!(json["failure_class"], "runner-exited");
+        assert!(json.get("ignored").is_none());
+    }
+
+    struct CountingRunner {
+        calls: std::sync::atomic::AtomicUsize,
+        exit: TestExit,
+        stdout: String,
+    }
+
+    impl TestCommandRunner for CountingRunner {
+        fn run(
+            &self,
+            _args: &[String],
+            _cwd: &std::path::Path,
+        ) -> crate::spec_core::SpecResult<TestRun> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(TestRun {
+                exit: self.exit,
+                stdout: self.stdout.clone(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    fn verify_with_runner(
+        spec: &str,
+        runner: std::sync::Arc<CountingRunner>,
+    ) -> Vec<crate::spec_core::ScenarioResult> {
+        let dir = std::env::temp_dir().join(format!(
+            "agent-spec-test-verifier-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"probe\"\n").unwrap();
+        let doc = crate::spec_parser::parse_spec_from_str(spec).unwrap();
+        let ctx = crate::spec_verify::VerificationContext {
+            code_paths: vec![dir.clone()],
+            change_paths: Vec::new(),
+            ai_mode: crate::spec_verify::AiMode::Off,
+            resolved_spec: crate::spec_parser::resolve_spec(doc, &[]).unwrap(),
+        };
+        let results = TestVerifier::with_runner(runner).verify(&ctx).unwrap();
+        std::fs::remove_dir_all(dir).ok();
+        results
+    }
+
+    const ONE_SCENARIO_SPEC: &str = "spec: task\nname: \"Probe\"\n---\n\n## Completion Criteria\n\nScenario: probe case\n  Test: probe_case\n  Given a bound test\n  When it is verified\n  Then a verdict is recorded\n";
+
+    #[test]
+    fn test_runner_exit_is_not_retried() {
+        let runner = std::sync::Arc::new(CountingRunner {
+            calls: Default::default(),
+            exit: exit(255),
+            stdout: String::new(),
+        });
+        let results = verify_with_runner(ONE_SCENARIO_SPEC, runner.clone());
+        assert_eq!(runner.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].verdict, Verdict::Uncertain);
     }
 
     #[test]

@@ -211,7 +211,7 @@ impl SpecGateway {
         let structural = StructuralVerifier;
         let boundaries = BoundariesVerifier;
         let atlas_symbols = AtlasSymbolVerifier;
-        let test = TestVerifier;
+        let test = TestVerifier::default();
         let complexity = ComplexityVerifier;
         let verifiers: Vec<&dyn Verifier> = vec![
             &structural,

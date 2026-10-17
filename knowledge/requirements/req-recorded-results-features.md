@@ -2,7 +2,7 @@
 kind: requirement
 id: REQ-RECORDED-RESULTS-FEATURES
 title: "Recorded Results Features"
-status: proposed
+status: accepted
 liveness: auto
 tags: [verify, guard, ci, cargo]
 ---

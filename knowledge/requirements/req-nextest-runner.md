@@ -2,7 +2,7 @@
 kind: requirement
 id: REQ-NEXTEST-RUNNER
 title: "Nextest Runner"
-status: proposed
+status: accepted
 liveness: auto
 tags: [verify, guard, lifecycle, performance, cargo]
 ---

@@ -2,7 +2,7 @@
 kind: requirement
 id: REQ-RECORDED-TEST-RESULTS
 title: "Recorded Test Results"
-status: proposed
+status: accepted
 liveness: auto
 tags: [verify, guard, lifecycle, ci]
 ---

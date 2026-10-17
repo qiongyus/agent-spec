@@ -32,6 +32,11 @@ risk: B
 - Cargo.lock
 - CHANGELOG.md
 - specs/task-recorded-test-results.spec.md
+- AGENTS.md
+- skills/agent-spec-tool-first/SKILL.md
+- .claude/skills/agent-spec-tool-first/SKILL.md
+- book/src/ch07-lifecycle.md
+- book/src/ch08-boundaries-guard.md
 
 ### Forbidden
 - 不改变不给 `--test-results` 时的任何行为

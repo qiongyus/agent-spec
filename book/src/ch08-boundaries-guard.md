@@ -57,6 +57,27 @@ guard 不再拿整次提交的变更集去对照每一份活跃合同。一份�
 回填到各场景（测试路径包含 filter 即归属该场景）。默认 `--test-threads=1`；
 `--test-threads <N>` 调并发，`--no-batch` 退回每个场景一次 `cargo test -q`。
 
+### 测试结果的来源
+
+批量执行默认用 `cargo test`。另有两种来源，判定规则完全相同（同一个判定函数）：
+
+| 参数 | 做法 | 适用 |
+|---|---|---|
+| `--runner nextest` | 每组一次 `cargo nextest run -E 'test(~<filter>) \| …'`，从它写出的 JUnit 报告读结果；测试二进制之间并行 | 测试二进制多而慢、本地或 soak 仍要现场运行时 |
+| `--test-results <junit.xml>`（可重复） | 不编译、不运行，按报告判定：`Package: P` 匹配二进制 id 为 `P` 或 `P::…` 的用例，filter 按子串匹配 | CI 里前一个作业已经跑完全部测试并留下报告时 |
+
+报告不记录运行时开启的 cargo features，用 `--test-results-features <pkg/feature,…>`
+声明：声明了 `Features:` 而未被覆盖的场景判 `uncertain`（`results-feature-mismatch`），
+未声明 features 的场景按报告判定。guard 的汇总行写明用了几份报告、多少用例、哪些
+features。报告是否来自同一提交由调用方负责——只用同一条流水线里的作业产物。
+
+```bash
+# CI：test 作业已用 nextest 跑完并写出 target/nextest/ci/junit.xml
+agent-spec guard --spec-dir specs --code . \
+  --test-results target/nextest/ci/junit.xml \
+  --test-results-features my-crate/test-hooks
+```
+
 ## `### Symbols`：把合同钉到真实符号上
 
 1.0 的合同可以在边界下声明代码符号引用：

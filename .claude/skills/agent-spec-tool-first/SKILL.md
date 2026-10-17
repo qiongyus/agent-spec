@@ -402,11 +402,11 @@ Establishes Contract → Commit traceability chain.
 | `pass` | Scenario verified | No action needed |
 | `fail` | Scenario failed verification | Read evidence, fix code |
 | `skip` | Test not found or not run | Add missing test or fix selector |
-| `uncertain` | Could not judge: no test ran (build or runner failure) or AI verification pending | Read the evidence: `failure_class` `compile-error` → fix the build; `runner-exited` → environment, retry once; AI → review manually or enable a backend |
+| `uncertain` | Could not judge: no test ran (build or runner failure) or AI verification pending | Read the evidence: `failure_class` `compile-error` → fix the build; `runner-exited` → environment, retry once; `runner-unavailable` → install cargo-nextest or drop `--runner nextest`; `results-feature-mismatch` → the `--test-results` run did not declare the scenario's `Features:` (`--test-results-features`); AI → review manually or enable a backend |
 | `pending_review` | Test passed; the scenario declares `Review: human` | Human sign-off; `--review-mode strict` counts it as non-passing |
 | `deferred` | `Mode: soak` scenario not run by this verification | Run with `--include-soak`; `--review-mode strict` and `resolve-ai` count it as non-passing |
 
-**Key rule: `skip` != `pass`**. All six verdicts (`pass`, `fail`, `skip`, `uncertain`, `pending_review`, `deferred`) are distinct. A scenario passes only when a bound test actually executed: a filter matching only `#[ignore]`d tests is `skip` ("bound test is #[ignore]d"). guard prints each `fail` / `uncertain` scenario's selector, exit status and last 40 output lines under the failing spec.
+**Key rule: `skip` != `pass`**. All six verdicts (`pass`, `fail`, `skip`, `uncertain`, `pending_review`, `deferred`) are distinct. A scenario passes only when a bound test actually executed: a filter matching only `#[ignore]`d tests is `skip` ("bound test is #[ignore]d"). guard prints each `fail` / `uncertain` scenario's selector, exit status and last 40 output lines under the failing spec. `--runner nextest` runs each batch group with cargo-nextest; `--test-results <junit.xml>` judges scenarios from existing JUnit reports without running anything (`--test-results-features` declares the recorded run's cargo features).
 
 ## VCS Awareness
 

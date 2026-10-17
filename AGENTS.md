@@ -371,7 +371,7 @@ When `lifecycle` fails:
 | `pass` | Scenario verified | No action needed |
 | `fail` | Scenario failed verification | Read evidence, fix code |
 | `skip` | Test not found or not run | Add missing test or fix selector |
-| `uncertain` | Could not judge: no test ran (build or runner failure) or AI verification pending | Read the evidence: `failure_class` `compile-error` → fix the build; `runner-exited` → environment, retry once; AI → review manually or enable a backend |
+| `uncertain` | Could not judge: no test ran (build or runner failure) or AI verification pending | Read the evidence: `failure_class` `compile-error` → fix the build; `runner-exited` → environment, retry once; `runner-unavailable` → install cargo-nextest or drop `--runner nextest`; `results-feature-mismatch` → the `--test-results` run did not declare the scenario's `Features:` (`--test-results-features`); AI → review manually or enable a backend |
 | `pending_review` | Test passed; the scenario declares `Review: human` | Human sign-off; `--review-mode strict` counts it as non-passing |
 | `deferred` | `Mode: soak` scenario not run by this verification | Run with `--include-soak`; `--review-mode strict` and `resolve-ai` count it as non-passing |
 
@@ -520,6 +520,8 @@ Constraints and decisions inherit downward. Both `.spec` and `.spec.md` extensio
 - A ready requirement whose only contract sits in `specs/roadmap/` reports Info `requirement-staged`, not Error `requirement-uncovered`
 - guard holds each contract to its own boundaries: only commits that touch a contract's territory are checked against its `Allowed changes` / `Forbidden` (`--strict-boundaries` for the whole-commit check)
 - Bound tests run batched, one `cargo test` per (package, features) group (`--no-batch` for one run per scenario, `--test-threads <N>` for concurrency)
+- `--runner nextest` runs each group as one `cargo nextest run` (test binaries in parallel); `--test-threads <N>` is then tests at a time across the group
+- `--test-results <junit.xml>` (repeatable) judges scenarios from existing JUnit reports and runs nothing — for CI jobs that already ran the suite; declare the recorded run's features with `--test-results-features <pkg/feature,…>` (a scenario with undeclared `Features:` is `uncertain`). The report's provenance is the caller's responsibility: pass a report from the same pipeline
 - **skip ≠ pass**: skipped scenarios block the pipeline
 
 ### Intent Compiler Workflow

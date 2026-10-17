@@ -46,7 +46,9 @@ failed=skipped=uncertain=0——任何"没验证"都不会被静默当作"验证
 guard 失败时，会在每个失败 spec 的汇总行下列出 `fail` / `uncertain` 场景的
 selector、退出码与输出最后 40 行，不必手工重跑来看原因。绑定测试按
 (package, features) 分组批量运行，每组一次 `cargo test`（`--no-batch` 退回逐场景，
-`--test-threads <N>` 调并发，默认 1）。
+`--test-threads <N>` 调并发，默认 1）。`--runner nextest` 改用 cargo-nextest 执行每组，
+测试二进制之间并行；`--test-results <junit.xml>` 直接读已有的 JUnit 报告判定，什么都不运行
+（见第 8 章「测试结果的来源」）。
 
 ## 重试循环
 

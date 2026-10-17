@@ -2,7 +2,7 @@
 kind: proposal
 id: LEP-008
 title: "Test Runners and Recorded Test Results"
-status: proposed
+status: accepted
 liveness: n/a
 tags: [verify, guard, ci]
 ---
@@ -246,17 +246,22 @@ enabled extra features — a weaker condition than a live run.
   exchange format between the job that runs tests and the jobs that read
   results.
 
-## Unresolved Questions
+## Resolved Questions
 
-- Flag names: `--runner`, `--test-results`, `--test-results-features`, or
-  a shorter pair.
-- Should guard warn when `--test-results` is given together with
-  `--change` / `--change-scope` options that limit which specs it checks?
-  (Not needed downstream, which uses `--change-scope none`.)
-- Implementation order: D2 + D3 + D4 first (the CI win), then D1. Both in
-  one release (1.6.0) or two.
+Put to the human (qiongyus) on 2026-10-17 and answered, except where noted:
 
-## Produces
+- Flag names: kept as `--runner`, `--test-results`, `--test-results-features`.
+- Release: D1–D4 ship together in one release (1.6.0). Implementation order
+  inside the release: D4 and D2 + D3 first, then D1.
+- D3 rule: scenarios without declared features accept a recorded run with
+  extra features (the relaxation stated in D3), chosen downstream for
+  amberlog on 2026-10-17.
+- Warning when `--test-results` is combined with change-scope options: not
+  put to the human; settled while drafting ADR-007 as the smaller change — no
+  warning, guard prints the report summary line (D3) in every case, and the
+  change-scope options keep their current meaning.
 
-- On acceptance: ADR-007 (test outcome sources) and governed requirements
-  for D1, D2, D3 (D4 is an implementation constraint recorded in ADR-007).
+## Produces: ADR-007
+
+Accepted 2026-10-17 by qiongyus. The produced decision records D1–D4 as
+stated above, with the resolutions in `## Resolved Questions`.

@@ -254,7 +254,7 @@ impl SpecGateway {
         let boundaries = BoundariesVerifier::with_exempt(self.boundary_exempt.clone());
         let atlas_symbols = AtlasSymbolVerifier;
         let test = TestVerifier::default()
-            .with_options(self.test_options)
+            .with_options(self.test_options.clone())
             .with_prefetched(self.test_prefetch.clone());
         let complexity = ComplexityVerifier;
         let verifiers: Vec<&dyn Verifier> = vec![

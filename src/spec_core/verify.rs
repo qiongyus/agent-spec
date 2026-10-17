@@ -111,6 +111,10 @@ pub struct TestOutputDetail {
     /// time libtest reported for this scenario's tests.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub duration_estimated: bool,
+    /// Where the outcome came from: `cargo`, `nextest`, or the supplied
+    /// report path(s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// Evidence supporting a verification verdict.

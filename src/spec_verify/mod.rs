@@ -2,6 +2,7 @@ mod ai_verifier;
 mod atlas_symbols;
 mod boundaries;
 mod complexity;
+mod junit;
 mod structural;
 mod test_batch;
 mod test_verifier;
@@ -21,7 +22,7 @@ pub use boundaries::{
 pub use complexity::ComplexityVerifier;
 pub use structural::StructuralVerifier;
 pub use test_batch::BatchOutcomes;
-pub use test_verifier::{TestRunOptions, TestVerifier};
+pub use test_verifier::{RecordedResults, TestRunOptions, TestRunner, TestVerifier};
 
 /// AI verifier mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

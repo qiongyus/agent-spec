@@ -100,6 +100,8 @@ enum Commands {
         /// libtest --test-threads for batched runs (default 1)
         #[arg(long)]
         test_threads: Option<usize>,
+        #[command(flatten)]
+        test_source: TestSourceArgs,
     },
     /// Render the coverage matrix (Rule × Scenario × Test × Verdict × Provenance)
     Matrix {
@@ -251,6 +253,8 @@ enum Commands {
         /// libtest --test-threads for batched runs (default 1)
         #[arg(long)]
         test_threads: Option<usize>,
+        #[command(flatten)]
+        test_source: TestSourceArgs,
     },
     /// Render an explicit Task Contract for agent execution
     Contract {
@@ -288,6 +292,8 @@ enum Commands {
         /// libtest --test-threads for batched runs (default 1)
         #[arg(long)]
         test_threads: Option<usize>,
+        #[command(flatten)]
+        test_source: TestSourceArgs,
     },
     /// Generate a human-readable contract review summary
     Explain {
@@ -1477,6 +1483,69 @@ fn main() -> ExitCode {
     }
 }
 
+/// Where bound tests' outcomes come from (LEP-008): the runner that executes
+/// them, or recorded JUnit reports that replace running anything.
+#[derive(clap::Args, Debug, Clone, Default)]
+struct TestSourceArgs {
+    /// Command each batch group runs as: cargo (default) or nextest
+    #[arg(long)]
+    runner: Option<String>,
+    /// Judge scenarios from this JUnit report instead of running tests
+    /// (repeatable)
+    #[arg(long = "test-results")]
+    test_results: Vec<PathBuf>,
+    /// Cargo features the recorded run enabled, as <package>/<feature> or
+    /// <feature>, comma-separated (with --test-results)
+    #[arg(long = "test-results-features", value_delimiter = ',')]
+    test_results_features: Vec<String>,
+}
+
+impl TestSourceArgs {
+    /// Check the combination and load any reports, before anything is
+    /// verified: a conflict or an unreadable report produces no verdict.
+    fn options(
+        &self,
+        include_soak: bool,
+        no_batch: bool,
+        test_threads: Option<usize>,
+    ) -> Result<crate::spec_verify::TestRunOptions, Box<dyn std::error::Error>> {
+        let runner = match &self.runner {
+            Some(value) => crate::spec_verify::TestRunner::parse(value)?,
+            None => crate::spec_verify::TestRunner::Cargo,
+        };
+        let recorded = !self.test_results.is_empty();
+        if !recorded && !self.test_results_features.is_empty() {
+            return Err("--test-results-features requires --test-results".into());
+        }
+        if recorded && self.runner.is_some() {
+            return Err("--test-results cannot be combined with --runner".into());
+        }
+        if recorded && no_batch {
+            return Err("--test-results cannot be combined with --no-batch".into());
+        }
+        if runner == crate::spec_verify::TestRunner::Nextest && no_batch {
+            return Err("--runner nextest cannot be combined with --no-batch".into());
+        }
+        let recorded = if recorded {
+            Some(std::sync::Arc::new(
+                crate::spec_verify::RecordedResults::load(
+                    &self.test_results,
+                    &self.test_results_features,
+                )?,
+            ))
+        } else {
+            None
+        };
+        Ok(crate::spec_verify::TestRunOptions {
+            include_soak,
+            no_batch,
+            test_threads,
+            runner,
+            recorded,
+        })
+    }
+}
+
 fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Commands::Parse { files, format } => cmd_parse(&files, &format),
@@ -1496,6 +1565,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             include_soak,
             no_batch,
             test_threads,
+            test_source,
         } => cmd_verify(
             &spec,
             &code,
@@ -1504,11 +1574,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             &ai_mode,
             &format,
             emit_questions,
-            crate::spec_verify::TestRunOptions {
-                include_soak,
-                no_batch,
-                test_threads,
-            },
+            test_source.options(include_soak, no_batch, test_threads)?,
         ),
         Commands::Matrix {
             spec,
@@ -1565,6 +1631,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             include_soak,
             no_batch,
             test_threads,
+            test_source,
         } => cmd_lifecycle(
             &spec,
             &code,
@@ -1578,11 +1645,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             layers.as_deref(),
             resume,
             &review_mode,
-            crate::spec_verify::TestRunOptions {
-                include_soak,
-                no_batch,
-                test_threads,
-            },
+            test_source.options(include_soak, no_batch, test_threads)?,
         ),
         Commands::Contract { spec, format } => cmd_contract(&spec, &format),
         Commands::Guard {
@@ -1594,6 +1657,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             strict_boundaries,
             no_batch,
             test_threads,
+            test_source,
         } => cmd_guard(
             &spec_dir,
             &code,
@@ -1601,11 +1665,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             &change_scope,
             min_score,
             strict_boundaries,
-            crate::spec_verify::TestRunOptions {
-                include_soak: false,
-                no_batch,
-                test_threads,
-            },
+            test_source.options(false, no_batch, test_threads)?,
         ),
         Commands::Explain {
             spec,
@@ -2985,7 +3045,7 @@ fn cmd_guard(
         };
         let gw = gw
             .with_boundary_exemptions(plan.exempt)
-            .with_test_options(test_options)
+            .with_test_options(test_options.clone())
             .with_test_prefetch(prefetch.clone());
 
         // Lint check
@@ -3016,11 +3076,20 @@ fn cmd_guard(
         }
     }
 
+    // LEP-008 D3: say where the verdicts came from when no test ran here.
+    let source = test_options
+        .recorded
+        .as_ref()
+        .map(|recorded| format!(" ({})", recorded.summary()))
+        .unwrap_or_default();
     if errors.is_empty() {
-        eprintln!("agent-spec guard: {} spec(s) passed", spec_files.len());
+        eprintln!(
+            "agent-spec guard: {} spec(s) passed{source}",
+            spec_files.len()
+        );
         Ok(())
     } else {
-        eprintln!("agent-spec guard: FAILED");
+        eprintln!("agent-spec guard: FAILED{source}");
         for (err, detail) in &errors {
             eprintln!("  - {err}");
             for line in detail {
@@ -8764,6 +8833,54 @@ name: "退款"
             duration_ms: 1,
             provenance: None,
         }
+    }
+
+    fn test_source(
+        runner: Option<&str>,
+        results: &[&str],
+        features: &[&str],
+    ) -> super::TestSourceArgs {
+        super::TestSourceArgs {
+            runner: runner.map(str::to_string),
+            test_results: results.iter().map(PathBuf::from).collect(),
+            test_results_features: features.iter().map(|f| f.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn test_test_results_conflicts_with_runner_and_no_batch() {
+        // The conflict is reported before the report is even read.
+        let with_runner = test_source(Some("nextest"), &["r.xml"], &[]);
+        let err = with_runner.options(false, false, None).unwrap_err();
+        assert!(err.to_string().contains("--runner"), "{err}");
+        let with_no_batch = test_source(None, &["r.xml"], &[]);
+        let err = with_no_batch.options(false, true, None).unwrap_err();
+        assert!(err.to_string().contains("--no-batch"), "{err}");
+    }
+
+    #[test]
+    fn test_test_results_features_require_test_results() {
+        let err = test_source(None, &[], &["alpha/fi"])
+            .options(false, false, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("--test-results"), "{err}");
+    }
+
+    #[test]
+    fn test_runner_nextest_conflicts_with_no_batch() {
+        let err = test_source(Some("nextest"), &[], &[])
+            .options(false, true, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("--no-batch"), "{err}");
+        let options = test_source(Some("nextest"), &[], &[])
+            .options(false, false, Some(8))
+            .unwrap();
+        assert_eq!(options.runner, crate::spec_verify::TestRunner::Nextest);
+        assert_eq!(options.test_threads, Some(8));
+        let default = test_source(None, &[], &[])
+            .options(false, false, None)
+            .unwrap();
+        assert_eq!(default, crate::spec_verify::TestRunOptions::default());
     }
 
     #[test]

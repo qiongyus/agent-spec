@@ -6,6 +6,44 @@ All notable changes to `agent-spec` are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- Recorded test results (LEP-008 → ADR-007 → REQ-RECORDED-TEST-RESULTS):
+  `verify`, `lifecycle` and `guard` accept `--test-results <junit.xml>`
+  (repeatable) and judge scenarios from those JUnit reports without building
+  or running anything. A selector with `Package: P` matches test cases whose
+  binary id (`classname`, or the `<testsuite name>`) is `P` or starts with
+  `P::`; the filter matches by substring, as before. `<failure>` / `<error>`
+  is a failure, `<skipped>` did not execute, anything else passed, and the
+  existing verdict rules apply unchanged (nothing matched or nothing executed
+  is `skip`). When several reports hold the same test, a failure wins. A
+  report that cannot be read or parsed is an error naming the file, and no
+  verdict is produced. guard's summary line names the reports and the number
+  of test cases.
+- Recorded results features (REQ-RECORDED-RESULTS-FEATURES):
+  `--test-results-features <pkg/feature,…>` declares the cargo features the
+  recorded run enabled (a bare `<feature>` applies to any package). A
+  scenario whose `Features:` are not all declared is `uncertain`
+  (`results-feature-mismatch`) and guard lists the missing features; a
+  scenario without `Features:` is judged from the reports whatever features
+  the run enabled.
+- Nextest runner (REQ-NEXTEST-RUNNER): `--runner nextest` runs each batch
+  group as one `cargo nextest run` (`-E 'test(~<filter>) | …'`,
+  `--test-threads <N>`, `--run-ignored all` for soak groups) and reads the
+  outcomes from the JUnit report it writes through a private
+  `--tool-config-file` profile (`agent-spec`, which inherits the project's
+  `default` profile). Test binaries of a group therefore run in parallel.
+  Without `cargo nextest` every scenario is `uncertain`
+  (`runner-unavailable`). nextest does not run doctests.
+- Test evidence records its `source`: `cargo`, `nextest`, or the report
+  path(s).
+
+### Changed
+
+- `--test-results` cannot be combined with `--runner` or `--no-batch`, and
+  `--runner nextest` cannot be combined with `--no-batch`; each combination
+  is a usage error before anything is verified.
+
 ## [1.5.0] - 2026-09-30
 
 The **honest verdicts** release (LEP-007 → ADR-006): a green gate means the

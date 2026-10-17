@@ -11,7 +11,8 @@ use crate::spec_core::{
 };
 
 use super::test_batch::{
-    BatchOutcomes, GroupKey, GroupOutcome, TestBatchPlan, attribute, execute_plan,
+    BatchOutcomes, GroupKey, GroupOutcome, LineOutcome, OutcomeSource, TestBatchPlan, TestLine,
+    attribute, execute_plan,
 };
 use super::{VerificationContext, Verifier};
 
@@ -27,7 +28,7 @@ pub struct TestVerifier {
 }
 
 /// How bound tests are run.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TestRunOptions {
     /// Run `Mode: soak` scenarios (with `--include-ignored`) instead of
     /// reporting them `deferred`.
@@ -36,8 +37,188 @@ pub struct TestRunOptions {
     /// (package, features, soak) group.
     pub no_batch: bool,
     /// libtest `--test-threads` for batched runs (default 1, so tests
-    /// validated one at a time are not suddenly run concurrently).
+    /// validated one at a time are not suddenly run concurrently); for
+    /// nextest, tests at a time across the group's binaries.
     pub test_threads: Option<usize>,
+    /// What executes each batch group (LEP-008 D1).
+    pub runner: TestRunner,
+    /// Judge scenarios from supplied JUnit reports instead of running
+    /// anything (LEP-008 D2, D3).
+    pub recorded: Option<Arc<RecordedResults>>,
+}
+
+/// The command each batch group runs as.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TestRunner {
+    #[default]
+    Cargo,
+    Nextest,
+}
+
+impl TestRunner {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "cargo" => Ok(Self::Cargo),
+            "nextest" => Ok(Self::Nextest),
+            other => Err(format!(
+                "unknown --runner `{other}` (expected cargo or nextest)"
+            )),
+        }
+    }
+}
+
+/// Test outcomes read from JUnit reports (`--test-results`) and the cargo
+/// features the recorded run enabled (`--test-results-features`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecordedResults {
+    paths: Arc<Vec<String>>,
+    /// One outcome per (binary id, test path); a failure in any report wins.
+    lines: Vec<TestLine>,
+    features: Vec<DeclaredFeature>,
+}
+
+/// `<package>/<feature>`, or `<feature>` for any package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeclaredFeature {
+    package: Option<String>,
+    feature: String,
+}
+
+impl RecordedResults {
+    /// Load every report; a report that cannot be read or parsed is an error
+    /// naming its path, and no verdict is produced from any of them.
+    pub fn load(paths: &[PathBuf], features: &[String]) -> SpecResult<Self> {
+        let mut merged: Vec<TestLine> = Vec::new();
+        let mut index: HashMap<(Option<String>, String), usize> = HashMap::new();
+        for (report, path) in paths.iter().enumerate() {
+            for mut line in super::junit::load_junit(path)? {
+                line.report = Some(report);
+                let key = (line.binary_id.clone(), line.path.clone());
+                match index.get(&key) {
+                    Some(&at) => {
+                        if outcome_rank(line.outcome) > outcome_rank(merged[at].outcome) {
+                            merged[at] = line;
+                        }
+                    }
+                    None => {
+                        index.insert(key, merged.len());
+                        merged.push(line);
+                    }
+                }
+            }
+        }
+        let features = features
+            .iter()
+            .map(|entry| entry.trim())
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| match entry.split_once('/') {
+                Some((package, feature)) => DeclaredFeature {
+                    package: Some(package.trim().to_string()),
+                    feature: feature.trim().to_string(),
+                },
+                None => DeclaredFeature {
+                    package: None,
+                    feature: entry.to_string(),
+                },
+            })
+            .collect();
+        Ok(Self {
+            paths: Arc::new(paths.iter().map(|p| p.display().to_string()).collect()),
+            lines: merged,
+            features,
+        })
+    }
+
+    /// `results from 1 report: 1337 test cases; features: a/b` — the source
+    /// guard names in its summary line.
+    pub fn summary(&self) -> String {
+        let reports = self.paths.len();
+        let mut text = format!(
+            "results from {reports} report{}: {} test case{}",
+            if reports == 1 { "" } else { "s" },
+            self.lines.len(),
+            if self.lines.len() == 1 { "" } else { "s" },
+        );
+        if !self.features.is_empty() {
+            let features = self
+                .features
+                .iter()
+                .map(|declared| match &declared.package {
+                    Some(package) => format!("{package}/{}", declared.feature),
+                    None => declared.feature.clone(),
+                })
+                .collect::<Vec<_>>();
+            text.push_str(&format!("; features: {}", features.join(", ")));
+        }
+        text
+    }
+
+    /// The selector's features the declared run features do not cover.
+    fn missing_features(&self, selector: &TestSelector) -> Vec<String> {
+        let Some(features) = selector_features(selector) else {
+            return Vec::new();
+        };
+        features
+            .split(',')
+            .map(str::trim)
+            .filter(|feature| !feature.is_empty())
+            .filter(|feature| {
+                !self.features.iter().any(|declared| {
+                    declared.feature == *feature
+                        && match &declared.package {
+                            None => true,
+                            Some(package) => selector.package.as_deref() == Some(package),
+                        }
+                })
+            })
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The recorded outcomes a selector may match, as one group: tests of
+    /// binaries `P` and `P::…` for `Package: P`, every test otherwise.
+    fn group_for(&self, package: Option<&str>) -> GroupOutcome {
+        let lines = self
+            .lines
+            .iter()
+            .filter(|line| match package {
+                None => true,
+                Some(package) => line.binary_id.as_deref().is_some_and(|binary| {
+                    binary == package
+                        || binary
+                            .strip_prefix(package)
+                            .is_some_and(|rest| rest.starts_with("::"))
+                }),
+            })
+            .cloned()
+            .collect();
+        GroupOutcome {
+            run: TestRun {
+                exit: TestExit {
+                    success: true,
+                    code: None,
+                    signal: None,
+                },
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+            output: String::new(),
+            lines,
+            wall_ms: 0,
+            scenario_count: 1,
+            source: OutcomeSource::Recorded(Arc::clone(&self.paths)),
+            not_run: None,
+        }
+    }
+}
+
+/// A failure outranks a pass, which outranks a skip.
+fn outcome_rank(outcome: LineOutcome) -> u8 {
+    match outcome {
+        LineOutcome::Ignored => 0,
+        LineOutcome::Ok => 1,
+        LineOutcome::Failed => 2,
+    }
 }
 
 impl Default for TestVerifier {
@@ -67,7 +248,7 @@ impl TestVerifier {
         code_paths: &[PathBuf],
         options: &TestRunOptions,
     ) -> SpecResult<Option<Arc<BatchOutcomes>>> {
-        if options.no_batch {
+        if options.no_batch || options.recorded.is_some() {
             return Ok(None);
         }
         let Some(workspace_root) = find_workspace_root(code_paths) else {
@@ -189,6 +370,13 @@ impl Verifier for TestVerifier {
             })
             .collect::<Vec<_>>();
 
+        if let Some(recorded) = &self.options.recorded {
+            return Ok(bound
+                .iter()
+                .map(|(scenario, binding)| self.recorded_result(scenario, binding, recorded))
+                .collect());
+        }
+
         let outcomes = if self.options.no_batch {
             None
         } else if let Some(prefetched) = &self.prefetched {
@@ -234,6 +422,47 @@ impl Verifier for TestVerifier {
 }
 
 impl TestVerifier {
+    /// A scenario judged from supplied reports; nothing runs.
+    fn recorded_result(
+        &self,
+        scenario: &Scenario,
+        binding: &TestBinding,
+        recorded: &RecordedResults,
+    ) -> ScenarioResult {
+        if scenario.mode == ScenarioMode::Soak && !self.options.include_soak {
+            return deferred_result(scenario);
+        }
+        let missing = recorded.missing_features(&binding.selector);
+        if !missing.is_empty() {
+            let judgment = TestJudgment {
+                verdict: Verdict::Uncertain,
+                kind: JudgmentKind::FeatureMismatch,
+                summary: None,
+                failure_class: Some("results-feature-mismatch"),
+            };
+            let stdout = format!(
+                "recorded test results do not cover required features: {}\n({})",
+                missing.join(", "),
+                recorded.summary()
+            );
+            let no_exit = TestExit {
+                success: false,
+                code: None,
+                signal: None,
+            };
+            let evidence = test_output_evidence(
+                &binding.selector,
+                stdout,
+                &no_exit,
+                &judgment,
+                recorded.paths.join(", "),
+            );
+            return scenario_result(scenario, binding, &judgment, evidence, 0);
+        }
+        let group = recorded.group_for(binding.selector.package.as_deref());
+        batched_result(scenario, binding, &group)
+    }
+
     /// One `cargo test -q` for one scenario (the pre-batching invocation).
     fn run_one(
         &self,
@@ -252,7 +481,13 @@ impl TestVerifier {
 
         let combined = combine_output(&run.stdout, &run.stderr);
         let judgment = judge_test_run(&run.exit, &combined, scenario.review);
-        let evidence = test_output_evidence(&binding.selector, combined, &run.exit, &judgment);
+        let evidence = test_output_evidence(
+            &binding.selector,
+            combined,
+            &run.exit,
+            &judgment,
+            "cargo".to_string(),
+        );
         Ok(scenario_result(
             scenario,
             binding,
@@ -310,8 +545,24 @@ fn batched_result(
     } else {
         group.run.exit
     };
-    let mut evidence =
-        test_output_evidence(&binding.selector, batched.output, &exit, &batched.judgment);
+    let source = match &group.source {
+        OutcomeSource::Cargo => "cargo".to_string(),
+        OutcomeSource::Nextest => "nextest".to_string(),
+        OutcomeSource::Recorded(paths) if batched.reports.is_empty() => paths.join(", "),
+        OutcomeSource::Recorded(paths) => batched
+            .reports
+            .iter()
+            .filter_map(|report| paths.get(*report).cloned())
+            .collect::<Vec<_>>()
+            .join(", "),
+    };
+    let mut evidence = test_output_evidence(
+        &binding.selector,
+        batched.output,
+        &exit,
+        &batched.judgment,
+        source,
+    );
     if let Evidence::TestOutput { detail, .. } = &mut evidence {
         detail.duration_estimated = batched.duration_estimated;
     }
@@ -448,6 +699,7 @@ fn test_output_evidence(
     stdout: String,
     exit: &TestExit,
     judgment: &TestJudgment,
+    source: String,
 ) -> Evidence {
     Evidence::TestOutput {
         test_name: selector.label(),
@@ -467,6 +719,7 @@ fn test_output_evidence(
                 .filter(|ignored| *ignored > 0),
             failure_class: judgment.failure_class.map(str::to_string),
             duration_estimated: false,
+            source: Some(source),
         },
     }
 }
@@ -530,6 +783,8 @@ pub(crate) enum JudgmentKind {
     NoSummary,
     /// cargo exited non-zero before any test ran.
     NotRun,
+    /// Supplied test results do not cover the selector's features.
+    FeatureMismatch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -582,7 +837,7 @@ pub(crate) fn judge_test_run(exit: &TestExit, output: &str, review: ReviewMode) 
 
 /// A compile error never deserves a retry; a runner that exited without
 /// cargo output usually is an environment problem worth one.
-fn not_run_class(output: &str) -> &'static str {
+pub(crate) fn not_run_class(output: &str) -> &'static str {
     let compile_error = output.lines().any(|line| {
         let line = line.trim_start();
         line.starts_with("error[E") || line.contains("could not compile")
@@ -615,9 +870,15 @@ pub(crate) fn judgment_reason(
         JudgmentKind::NoSummary => format!(
             "could not judge `{selector_label}`: cargo printed no libtest `test result:` summary"
         ),
+        JudgmentKind::NotRun if judgment.failure_class == Some("runner-unavailable") => format!(
+            "could not run `{selector_label}`: cargo nextest is not available (runner-unavailable)"
+        ),
         JudgmentKind::NotRun => format!(
             "could not run `{selector_label}`: cargo exited before any test ran ({})",
             judgment.failure_class.unwrap_or("runner-exited")
+        ),
+        JudgmentKind::FeatureMismatch => format!(
+            "recorded test results do not cover the features `{selector_label}` requires (results-feature-mismatch)"
         ),
     }
 }
@@ -780,11 +1041,18 @@ mod tests {
             String::new(),
             &ok,
             &judgment,
+            "cargo".to_string(),
         );
         let json = serde_json::to_value(&with).unwrap();
         assert_eq!(json["features"], "probe");
 
-        let without = test_output_evidence(&selector(None, None), String::new(), &ok, &judgment);
+        let without = test_output_evidence(
+            &selector(None, None),
+            String::new(),
+            &ok,
+            &judgment,
+            "cargo".to_string(),
+        );
         let json = serde_json::to_value(&without).unwrap();
         assert!(json.get("features").is_none());
     }
@@ -892,7 +1160,8 @@ mod tests {
             (&passed, exit(0), passed_output.clone()),
             (&failed, exit(101), failed_output.clone()),
         ] {
-            let evidence = test_output_evidence(&selector, output, &run_exit, judgment);
+            let evidence =
+                test_output_evidence(&selector, output, &run_exit, judgment, "cargo".to_string());
             let json = serde_json::to_value(&evidence).unwrap();
             assert_eq!(json["ignored"], 1);
         }
@@ -915,7 +1184,13 @@ mod tests {
         let runner = judge_test_run(&exit(255), "", ReviewMode::Auto);
         assert_eq!(runner.verdict, Verdict::Uncertain);
         assert_eq!(runner.failure_class, Some("runner-exited"));
-        let evidence = test_output_evidence(&selector, String::new(), &exit(255), &runner);
+        let evidence = test_output_evidence(
+            &selector,
+            String::new(),
+            &exit(255),
+            &runner,
+            "cargo".to_string(),
+        );
         let json = serde_json::to_value(&evidence).unwrap();
         assert_eq!(json["exit_code"], 255);
         assert_eq!(json["failure_class"], "runner-exited");
@@ -1145,6 +1420,692 @@ mod tests {
         assert_eq!(runner.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].verdict, Verdict::Uncertain);
+    }
+
+    // ---- LEP-008: recorded test results and the nextest runner ----
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "agent-spec-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"probe\"\n").unwrap();
+        dir
+    }
+
+    /// A JUnit report from `(binary id, test name, outcome)` rows, where the
+    /// outcome is `ok`, `failure`, `error` or `skipped`.
+    fn junit(cases: &[(&str, &str, &str)]) -> String {
+        let mut xml = String::from("<testsuites name=\"nextest-run\">\n");
+        for (binary, name, outcome) in cases {
+            let child = match *outcome {
+                "failure" => "<failure message=\"boom\">assertion failed: boom</failure>",
+                "error" => "<error message=\"setup\"/>",
+                "skipped" => "<skipped/>",
+                _ => "",
+            };
+            xml.push_str(&format!(
+                "  <testsuite name=\"{binary}\"><testcase name=\"{name}\" classname=\"{binary}\" time=\"0.010\">{child}</testcase></testsuite>\n"
+            ));
+        }
+        xml.push_str("</testsuites>\n");
+        xml
+    }
+
+    fn write_report(
+        dir: &std::path::Path,
+        file: &str,
+        cases: &[(&str, &str, &str)],
+    ) -> std::path::PathBuf {
+        let path = dir.join(file);
+        std::fs::write(&path, junit(cases)).unwrap();
+        path
+    }
+
+    /// One scenario per `(selector lines, extra scenario lines)` entry.
+    fn spec_with(scenarios: &[(&str, &str)]) -> String {
+        let mut spec = String::from("spec: task\nname: \"Probe\"\n---\n\n## Completion Criteria\n");
+        for (index, (selector, extra)) in scenarios.iter().enumerate() {
+            spec.push_str(&format!(
+                "\nScenario: case {index}\n{extra}  Test:\n{selector}  Given a\n  When b\n  Then c\n"
+            ));
+        }
+        spec
+    }
+
+    fn sel(package: Option<&str>, filter: &str, features: Option<&str>) -> String {
+        let mut lines = String::new();
+        if let Some(package) = package {
+            lines.push_str(&format!("    Package: {package}\n"));
+        }
+        lines.push_str(&format!("    Filter: {filter}\n"));
+        if let Some(features) = features {
+            lines.push_str(&format!("    Features: {features}\n"));
+        }
+        lines
+    }
+
+    fn verify_spec_with(
+        dir: &std::path::Path,
+        spec: &str,
+        options: TestRunOptions,
+        runner: std::sync::Arc<dyn TestCommandRunner>,
+    ) -> Vec<crate::spec_core::ScenarioResult> {
+        let doc = crate::spec_parser::parse_spec_from_str(spec).unwrap();
+        let ctx = crate::spec_verify::VerificationContext {
+            code_paths: vec![dir.to_path_buf()],
+            change_paths: Vec::new(),
+            ai_mode: crate::spec_verify::AiMode::Off,
+            resolved_spec: crate::spec_parser::resolve_spec(doc, &[]).unwrap(),
+        };
+        TestVerifier::with_runner(runner)
+            .with_options(options)
+            .verify(&ctx)
+            .unwrap()
+    }
+
+    fn recorded_options(reports: &[std::path::PathBuf], features: &[&str]) -> TestRunOptions {
+        let features = features.iter().map(|f| f.to_string()).collect::<Vec<_>>();
+        TestRunOptions {
+            recorded: Some(std::sync::Arc::new(
+                super::RecordedResults::load(reports, &features).unwrap(),
+            )),
+            ..TestRunOptions::default()
+        }
+    }
+
+    fn counting() -> std::sync::Arc<CountingRunner> {
+        std::sync::Arc::new(CountingRunner {
+            calls: Default::default(),
+            exit: exit(0),
+            stdout: String::new(),
+        })
+    }
+
+    /// Verdicts of `spec` judged from `cases` with declared `features`.
+    fn recorded_verdicts(
+        scenarios: &[(&str, &str)],
+        cases: &[(&str, &str, &str)],
+        features: &[&str],
+    ) -> Vec<crate::spec_core::ScenarioResult> {
+        let dir = scratch_dir("recorded");
+        let report = write_report(&dir, "junit.xml", cases);
+        let results = verify_spec_with(
+            &dir,
+            &spec_with(scenarios),
+            recorded_options(&[report], features),
+            counting(),
+        );
+        std::fs::remove_dir_all(dir).ok();
+        results
+    }
+
+    fn evidence_json(result: &crate::spec_core::ScenarioResult) -> serde_json::Value {
+        serde_json::to_value(&result.evidence[0]).unwrap()
+    }
+
+    #[test]
+    fn test_recorded_results_merge_two_reports() {
+        let dir = scratch_dir("recorded-two");
+        let a = write_report(&dir, "a.xml", &[("alpha::sys", "case_one", "ok")]);
+        let b = write_report(&dir, "b.xml", &[("alpha::sys", "case_two", "ok")]);
+        let s1 = sel(Some("alpha"), "case_one", None);
+        let s2 = sel(Some("alpha"), "case_two", None);
+        let results = verify_spec_with(
+            &dir,
+            &spec_with(&[(&s1, ""), (&s2, "")]),
+            recorded_options(&[a, b], &[]),
+            counting(),
+        );
+        std::fs::remove_dir_all(dir).ok();
+        assert_eq!(
+            results.iter().map(|r| r.verdict).collect::<Vec<_>>(),
+            [Verdict::Pass, Verdict::Pass]
+        );
+    }
+
+    #[test]
+    fn test_recorded_results_run_no_test_command() {
+        let dir = scratch_dir("recorded-none");
+        let report = write_report(&dir, "junit.xml", &[("alpha::sys", "case_one", "ok")]);
+        let runner = counting();
+        let s1 = sel(Some("alpha"), "case_one", None);
+        let options = recorded_options(&[report], &[]);
+        assert!(
+            TestVerifier::prefetch(&[], std::slice::from_ref(&dir), &options)
+                .unwrap()
+                .is_none()
+        );
+        let results = verify_spec_with(&dir, &spec_with(&[(&s1, "")]), options, runner.clone());
+        std::fs::remove_dir_all(dir).ok();
+        assert_eq!(results[0].verdict, Verdict::Pass);
+        assert_eq!(runner.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn test_test_results_unreadable_report_is_an_error() {
+        let dir = scratch_dir("recorded-bad");
+        let missing = dir.join("missing.xml");
+        let err = super::RecordedResults::load(&[missing], &[]).unwrap_err();
+        assert!(err.to_string().contains("missing.xml"), "{err}");
+        let bad = dir.join("bad.xml");
+        std::fs::write(&bad, "not xml").unwrap();
+        let err = super::RecordedResults::load(&[bad], &[]).unwrap_err();
+        assert!(err.to_string().contains("bad.xml"), "{err}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn test_recorded_results_match_binaries_of_the_package() {
+        let x = sel(Some("alpha"), "case_x", None);
+        let y = sel(Some("alpha"), "case_y", None);
+        let z = sel(Some("alpha"), "case_z", None);
+        let results = recorded_verdicts(
+            &[(&x, ""), (&y, ""), (&z, "")],
+            &[
+                ("alpha::sys", "case_x", "ok"),
+                ("beta::sys", "case_x", "failure"),
+                ("alpha", "tests::case_y", "ok"),
+                ("alpha-extra::sys", "case_z", "ok"),
+            ],
+            &[],
+        );
+        assert_eq!(
+            results.iter().map(|r| r.verdict).collect::<Vec<_>>(),
+            [Verdict::Pass, Verdict::Pass, Verdict::Skip]
+        );
+    }
+
+    #[test]
+    fn test_recorded_results_without_package_match_any_binary() {
+        let w = sel(None, "case_w", None);
+        let results = recorded_verdicts(&[(&w, "")], &[("beta::sys", "case_w", "ok")], &[]);
+        assert_eq!(results[0].verdict, Verdict::Pass);
+    }
+
+    #[test]
+    fn test_recorded_results_match_filter_by_substring() {
+        let s = sel(Some("alpha"), "after_crash", None);
+        let results = recorded_verdicts(
+            &[(&s, "")],
+            &[("alpha::sys", "recovery::after_crash", "ok")],
+            &[],
+        );
+        assert_eq!(results[0].verdict, Verdict::Pass);
+    }
+
+    #[test]
+    fn test_recorded_results_verdicts_follow_attribution_rules() {
+        let absent = sel(Some("alpha"), "case_absent", None);
+        let skipped = sel(Some("alpha"), "case_skipped", None);
+        let mixed = sel(Some("alpha"), "case_mixed", None);
+        let errored = sel(Some("alpha"), "case_errored", None);
+        let passed = sel(Some("alpha"), "case_passed", None);
+        let human = sel(Some("alpha"), "case_human", None);
+        let results = recorded_verdicts(
+            &[
+                (&absent, ""),
+                (&skipped, ""),
+                (&mixed, ""),
+                (&errored, ""),
+                (&passed, ""),
+                (&human, "  Review: human\n"),
+            ],
+            &[
+                ("alpha::sys", "case_skipped", "skipped"),
+                ("alpha::sys", "case_mixed_one", "ok"),
+                ("alpha::sys", "case_mixed_two", "failure"),
+                ("alpha::sys", "case_errored", "error"),
+                ("alpha::sys", "case_passed_one", "ok"),
+                ("alpha::sys", "case_passed_two", "ok"),
+                ("alpha::sys", "case_human", "ok"),
+            ],
+            &[],
+        );
+        assert_eq!(
+            results.iter().map(|r| r.verdict).collect::<Vec<_>>(),
+            [
+                Verdict::Skip,
+                Verdict::Skip,
+                Verdict::Fail,
+                Verdict::Fail,
+                Verdict::Pass,
+                Verdict::PendingReview
+            ]
+        );
+        assert!(
+            results[0].step_results[0]
+                .reason
+                .contains("matched zero tests")
+        );
+        assert!(
+            results[1].step_results[0]
+                .reason
+                .contains("bound test is #[ignore]d")
+        );
+        assert!(
+            evidence_json(&results[2])["stdout"]
+                .as_str()
+                .unwrap()
+                .contains("assertion failed: boom")
+        );
+    }
+
+    #[test]
+    fn test_recorded_results_failure_in_any_report_wins() {
+        let dir = scratch_dir("recorded-dup");
+        let a = write_report(&dir, "a.xml", &[("alpha::sys", "case_d", "ok")]);
+        let b = write_report(&dir, "b.xml", &[("alpha::sys", "case_d", "failure")]);
+        let s = sel(Some("alpha"), "case_d", None);
+        for reports in [[a.clone(), b.clone()], [b.clone(), a.clone()]] {
+            let results = verify_spec_with(
+                &dir,
+                &spec_with(&[(&s, "")]),
+                recorded_options(&reports, &[]),
+                counting(),
+            );
+            assert_eq!(results[0].verdict, Verdict::Fail);
+            assert_eq!(
+                evidence_json(&results[0])["source"],
+                b.display().to_string()
+            );
+        }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn test_recorded_results_keep_soak_scenarios_deferred() {
+        let s = sel(Some("alpha"), "case_soak", None);
+        let results = recorded_verdicts(
+            &[(&s, "  Mode: soak\n")],
+            &[("alpha::sys", "case_soak", "ok")],
+            &[],
+        );
+        assert_eq!(results[0].verdict, Verdict::Deferred);
+    }
+
+    #[test]
+    fn test_recorded_and_libtest_outcomes_judge_alike() {
+        use crate::spec_verify::test_batch::{OutcomeSource, attribute, parse_test_lines};
+        let libtest = "running 3 tests\ntest sys::case_a ... ok\ntest sys::case_b ... FAILED\ntest sys::case_c ... ignored\ntest result: FAILED. 1 passed; 1 failed; 1 ignored\n";
+        let cargo_group = crate::spec_verify::test_batch::GroupOutcome {
+            run: TestRun {
+                exit: exit(101),
+                stdout: libtest.to_string(),
+                stderr: String::new(),
+            },
+            output: libtest.to_string(),
+            lines: parse_test_lines(libtest),
+            wall_ms: 30,
+            scenario_count: 4,
+            source: OutcomeSource::Cargo,
+            not_run: None,
+        };
+        let dir = scratch_dir("same-rules");
+        let report = write_report(
+            &dir,
+            "junit.xml",
+            &[
+                ("probe::sys", "sys::case_a", "ok"),
+                ("probe::sys", "sys::case_b", "failure"),
+                ("probe::sys", "sys::case_c", "skipped"),
+            ],
+        );
+        let recorded = super::RecordedResults::load(&[report], &[]).unwrap();
+        std::fs::remove_dir_all(dir).ok();
+        let recorded_group = recorded.group_for(Some("probe"));
+        for filter in ["case_a", "case_b", "case_c", "case_d"] {
+            let from_cargo = attribute(filter, ReviewMode::Auto, &cargo_group).judgment;
+            let from_report = attribute(filter, ReviewMode::Auto, &recorded_group).judgment;
+            assert_eq!(from_cargo.verdict, from_report.verdict, "{filter}");
+            assert_eq!(from_cargo.kind, from_report.kind, "{filter}");
+        }
+    }
+
+    #[test]
+    fn test_recorded_results_summary_names_reports_and_cases() {
+        let dir = scratch_dir("summary");
+        let report = write_report(
+            &dir,
+            "junit.xml",
+            &[
+                ("alpha::sys", "a", "ok"),
+                ("alpha::sys", "b", "ok"),
+                ("alpha::sys", "c", "ok"),
+            ],
+        );
+        let recorded = super::RecordedResults::load(&[report], &[]).unwrap();
+        std::fs::remove_dir_all(dir).ok();
+        let summary = recorded.summary();
+        assert!(summary.contains("1 report"), "{summary}");
+        assert!(summary.contains("3 test cases"), "{summary}");
+    }
+
+    #[test]
+    fn test_recorded_results_evidence_source_is_report_path() {
+        let dir = scratch_dir("evidence");
+        std::fs::create_dir_all(dir.join("reports")).unwrap();
+        let report = write_report(&dir, "reports/junit.xml", &[("alpha::sys", "case_e", "ok")]);
+        let s = sel(Some("alpha"), "case_e", None);
+        let results = verify_spec_with(
+            &dir,
+            &spec_with(&[(&s, "")]),
+            recorded_options(std::slice::from_ref(&report), &[]),
+            counting(),
+        );
+        std::fs::remove_dir_all(dir).ok();
+        assert_eq!(
+            evidence_json(&results[0])["source"],
+            report.display().to_string()
+        );
+        assert!(
+            report.display().to_string().ends_with("reports/junit.xml"),
+            "{}",
+            report.display()
+        );
+    }
+
+    #[test]
+    fn test_declared_features_parse_package_and_bare_entries() {
+        let s1 = sel(Some("alpha"), "case_one", Some("fi"));
+        let s2 = sel(Some("beta"), "case_two", Some("slow"));
+        let results = recorded_verdicts(
+            &[(&s1, ""), (&s2, "")],
+            &[
+                ("alpha::sys", "case_one", "ok"),
+                ("beta::sys", "case_two", "ok"),
+            ],
+            &[" alpha/fi", "beta/slow ", ""],
+        );
+        assert_eq!(
+            results.iter().map(|r| r.verdict).collect::<Vec<_>>(),
+            [Verdict::Pass, Verdict::Pass]
+        );
+    }
+
+    #[test]
+    fn test_declared_features_cover_scenario_features() {
+        let s = sel(Some("alpha"), "case_f", Some("fi"));
+        for declared in ["alpha/fi", "fi"] {
+            let results =
+                recorded_verdicts(&[(&s, "")], &[("alpha::sys", "case_f", "ok")], &[declared]);
+            assert_eq!(results[0].verdict, Verdict::Pass, "{declared}");
+        }
+        let failing = recorded_verdicts(
+            &[(&s, "")],
+            &[("alpha::sys", "case_f", "failure")],
+            &["alpha/fi"],
+        );
+        assert_eq!(failing[0].verdict, Verdict::Fail);
+    }
+
+    #[test]
+    fn test_undeclared_scenario_feature_is_uncertain() {
+        let s = sel(Some("alpha"), "case_f", Some("fi"));
+        let partial = sel(Some("alpha"), "case_f", Some("fi,slow"));
+        for (selector, declared) in [
+            (&s, &[][..]),
+            (&s, &["beta/fi"][..]),
+            (&partial, &["alpha/fi"][..]),
+        ] {
+            let results = recorded_verdicts(
+                &[(selector, "")],
+                &[("alpha::sys", "case_f", "ok")],
+                declared,
+            );
+            assert_eq!(results[0].verdict, Verdict::Uncertain, "{declared:?}");
+            assert_eq!(
+                evidence_json(&results[0])["failure_class"],
+                "results-feature-mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn test_feature_mismatch_lists_missing_features() {
+        let s = sel(Some("alpha"), "case_f", Some("fi,slow"));
+        let results = recorded_verdicts(
+            &[(&s, "")],
+            &[("alpha::sys", "case_f", "ok")],
+            &["alpha/fi"],
+        );
+        assert_eq!(results[0].verdict, Verdict::Uncertain);
+        let stdout = evidence_json(&results[0])["stdout"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(stdout.contains("slow"), "{stdout}");
+        assert!(!stdout.contains("required features: fi"), "{stdout}");
+    }
+
+    #[test]
+    fn test_scenario_without_package_needs_bare_feature() {
+        let s = sel(None, "case_g", Some("fi"));
+        let package_only = recorded_verdicts(
+            &[(&s, "")],
+            &[("alpha::sys", "case_g", "ok")],
+            &["alpha/fi"],
+        );
+        assert_eq!(package_only[0].verdict, Verdict::Uncertain);
+        let bare = recorded_verdicts(&[(&s, "")], &[("alpha::sys", "case_g", "ok")], &["fi"]);
+        assert_eq!(bare[0].verdict, Verdict::Pass);
+    }
+
+    #[test]
+    fn test_scenario_without_features_accepts_any_recorded_run() {
+        let s = sel(Some("alpha"), "case_h", None);
+        for declared in [&["alpha/fi"][..], &[][..]] {
+            let results =
+                recorded_verdicts(&[(&s, "")], &[("alpha::sys", "case_h", "ok")], declared);
+            assert_eq!(results[0].verdict, Verdict::Pass, "{declared:?}");
+        }
+    }
+
+    #[test]
+    fn test_recorded_results_summary_lists_declared_features() {
+        let dir = scratch_dir("summary-features");
+        let report = write_report(&dir, "junit.xml", &[("alpha::sys", "a", "ok")]);
+        let features = ["alpha/fi".to_string(), "beta/slow".to_string()];
+        let recorded = super::RecordedResults::load(&[report], &features).unwrap();
+        std::fs::remove_dir_all(dir).ok();
+        let summary = recorded.summary();
+        assert!(summary.contains("alpha/fi"), "{summary}");
+        assert!(summary.contains("beta/slow"), "{summary}");
+    }
+
+    #[test]
+    fn test_runner_flag_parses_cargo_and_nextest() {
+        assert_eq!(
+            super::TestRunner::parse("cargo"),
+            Ok(super::TestRunner::Cargo)
+        );
+        assert_eq!(
+            super::TestRunner::parse("nextest"),
+            Ok(super::TestRunner::Nextest)
+        );
+        assert!(super::TestRunner::parse("bazel").is_err());
+        assert_eq!(super::TestRunner::default(), super::TestRunner::Cargo);
+    }
+
+    /// Plays `cargo nextest run`: finds the JUnit path in the tool config
+    /// file named on the command line and writes `report` there (or nothing).
+    struct NextestStub {
+        calls: std::sync::Mutex<Vec<Vec<String>>>,
+        exit_code: i32,
+        output: String,
+        report: Option<String>,
+    }
+
+    impl TestCommandRunner for NextestStub {
+        fn run(
+            &self,
+            args: &[String],
+            _cwd: &std::path::Path,
+        ) -> crate::spec_core::SpecResult<TestRun> {
+            self.calls.lock().unwrap().push(args.to_vec());
+            if let Some(report) = &self.report {
+                let config = args
+                    .iter()
+                    .skip_while(|arg| *arg != "--tool-config-file")
+                    .nth(1)
+                    .and_then(|value| value.strip_prefix("agent-spec:"))
+                    .unwrap();
+                let text = std::fs::read_to_string(config).unwrap();
+                let junit = text
+                    .lines()
+                    .find_map(|line| line.strip_prefix("path = "))
+                    .unwrap()
+                    .trim_matches('\'');
+                std::fs::write(junit, report).unwrap();
+            }
+            Ok(TestRun {
+                exit: exit(self.exit_code),
+                stdout: self.output.clone(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    fn nextest_verdicts(
+        stub: NextestStub,
+        scenarios: &[(&str, &str)],
+    ) -> (Vec<Vec<String>>, Vec<crate::spec_core::ScenarioResult>) {
+        let dir = scratch_dir("nextest");
+        let stub = std::sync::Arc::new(stub);
+        let results = verify_spec_with(
+            &dir,
+            &spec_with(scenarios),
+            TestRunOptions {
+                runner: super::TestRunner::Nextest,
+                ..TestRunOptions::default()
+            },
+            stub.clone(),
+        );
+        std::fs::remove_dir_all(dir).ok();
+        let calls = stub.calls.lock().unwrap().clone();
+        (calls, results)
+    }
+
+    #[test]
+    fn test_nextest_outcomes_are_read_from_the_junit_report() {
+        let ok = sel(Some("probe"), "case_ok", None);
+        let failing = sel(Some("probe"), "case_fail", None);
+        let ignored = sel(Some("probe"), "case_ignored", None);
+        let (calls, results) = nextest_verdicts(
+            NextestStub {
+                calls: Default::default(),
+                exit_code: 100,
+                output: "error: test run failed\n".into(),
+                // nextest leaves ignored tests out of its report.
+                report: Some(junit(&[
+                    ("probe::sys", "case_ok", "ok"),
+                    ("probe::sys", "case_fail", "failure"),
+                ])),
+            },
+            &[(&ok, ""), (&failing, ""), (&ignored, "")],
+        );
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(&calls[0][..2], ["nextest", "run"]);
+        assert_eq!(
+            results.iter().map(|r| r.verdict).collect::<Vec<_>>(),
+            [Verdict::Pass, Verdict::Fail, Verdict::Skip]
+        );
+    }
+
+    #[test]
+    fn test_nextest_groups_never_fall_back_to_per_scenario_runs() {
+        // A successful run with an empty report: unlike a cargo group with no
+        // per-test lines, nothing is re-run one scenario at a time.
+        let a = sel(Some("probe"), "case_a", None);
+        let b = sel(Some("probe"), "case_b", None);
+        let (calls, results) = nextest_verdicts(
+            NextestStub {
+                calls: Default::default(),
+                exit_code: 0,
+                output: "Starting 0 tests across 2 binaries\n".into(),
+                report: Some(junit(&[])),
+            },
+            &[(&a, ""), (&b, "")],
+        );
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert!(results.iter().all(|r| r.verdict == Verdict::Skip));
+    }
+
+    #[test]
+    fn test_nextest_group_without_report_is_uncertain() {
+        let s = sel(Some("probe"), "case_ok", None);
+        let (_, results) = nextest_verdicts(
+            NextestStub {
+                calls: Default::default(),
+                exit_code: 101,
+                output: "error[E0425]: cannot find value `x` in this scope\nerror: could not compile `probe`\n".into(),
+                report: None,
+            },
+            &[(&s, "")],
+        );
+        assert_eq!(results[0].verdict, Verdict::Uncertain);
+        assert_eq!(evidence_json(&results[0])["failure_class"], "compile-error");
+    }
+
+    #[test]
+    fn test_missing_nextest_marks_scenarios_runner_unavailable() {
+        let a = sel(Some("probe"), "case_a", None);
+        let b = sel(Some("other"), "case_b", Some("fi"));
+        let (_, results) = nextest_verdicts(
+            NextestStub {
+                calls: Default::default(),
+                exit_code: 101,
+                output: "error: no such command: `nextest`\n".into(),
+                report: None,
+            },
+            &[(&a, ""), (&b, "")],
+        );
+        for result in &results {
+            assert_eq!(result.verdict, Verdict::Uncertain);
+            assert_eq!(evidence_json(result)["failure_class"], "runner-unavailable");
+            assert!(
+                result.step_results[0].reason.contains("runner-unavailable"),
+                "{}",
+                result.step_results[0].reason
+            );
+        }
+    }
+
+    #[test]
+    fn test_evidence_source_names_the_runner() {
+        let s = sel(Some("probe"), "case_ok", None);
+        let (_, nextest) = nextest_verdicts(
+            NextestStub {
+                calls: Default::default(),
+                exit_code: 0,
+                output: String::new(),
+                report: Some(junit(&[("probe::sys", "case_ok", "ok")])),
+            },
+            &[(&s, "")],
+        );
+        assert_eq!(evidence_json(&nextest[0])["source"], "nextest");
+
+        let dir = scratch_dir("cargo-source");
+        let cargo = verify_spec_with(
+            &dir,
+            &spec_with(&[(&s, "")]),
+            TestRunOptions::default(),
+            std::sync::Arc::new(ScriptRunner {
+                calls: Default::default(),
+                exit_code: 0,
+                stdout: format!(
+                    "running 1 test\ntest sys::case_ok ... ok\n{}\n",
+                    summary_line(1, 0, 0)
+                ),
+            }),
+        );
+        std::fs::remove_dir_all(dir).ok();
+        assert_eq!(evidence_json(&cargo[0])["source"], "cargo");
     }
 
     #[test]

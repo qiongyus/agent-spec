@@ -5,7 +5,7 @@ description: Use when converting PRD or issue prose into KLL requirements, runni
 
 # Agent Spec Intent Compiler
 
-> **Version:** 1.0.0 | **Last Updated:** 2026-09-30 | **Tracks:** agent-spec 1.5.0
+> **Version:** 1.0.0 | **Last Updated:** 2026-10-17 | **Tracks:** agent-spec 1.6.0
 
 Use this skill when a user wants to move from raw PRD/issue prose to governed KLL requirements and task specs.
 

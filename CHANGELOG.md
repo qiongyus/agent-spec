@@ -6,6 +6,21 @@ All notable changes to `agent-spec` are documented here. Format follows
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-10-17
+
+The **test outcome sources** release (LEP-008 → ADR-007): guard no longer has
+to run the same tests a second time. It can judge scenarios from JUnit
+reports an earlier CI job already wrote (`--test-results`, with
+`--test-results-features` declaring that run's cargo features), or run each
+batch group with cargo-nextest so test binaries run in parallel
+(`--runner nextest`). Every source goes through the same verdict function.
+
+**Upgrade notes.** Without the new flags nothing changes, except that test
+evidence now carries a `source` field (`cargo`). With `--test-results`, the
+report's provenance is the caller's responsibility: pass a report from the
+same pipeline. Scenarios without `Features:` are judged from a recorded run
+whatever features it enabled; scenarios with `Features:` need them declared.
+
 ### Added
 
 - Recorded test results (LEP-008 → ADR-007 → REQ-RECORDED-TEST-RESULTS):
